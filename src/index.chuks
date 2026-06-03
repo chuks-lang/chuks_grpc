@@ -12,11 +12,14 @@
 //   • All four RPC types: unary, server-streaming, client-streaming, bidi.
 //   • Full HTTP/2 multiplexing, flow control and CONTINUATION via the actor-
 //     model transport (transport.chuks): a per-connection mux + reader task.
-//   • No built-in TLS server yet (std/net exposes a plaintext listener only).
+//   • TLS and mutual-TLS (mTLS): pass tlsOptions to GrpcServer/GrpcClient to run
+//     gRPC over an encrypted HTTP/2 channel. Server handlers can read the peer's
+//     certificate Common Name for mTLS identity via GrpcServerStream.peerCommonName()
+//     or GrpcRequest.peerCN. Omit tlsOptions to keep cleartext h2c.
 //   • No .proto codegen — you serialize/deserialize with ProtoWriter/Reader.
 // ───────────────────────────────────────────────────────────────────────────
 
-import { TcpConnection, TcpServer } from "std/net"
+import { TcpConnection, TcpServer, TlsConnection, TlsServer } from "std/net"
 import { Buffer } from "std/buffer"
 import { compress } from "std/compress"
 import { time } from "std/time"
@@ -53,6 +56,7 @@ export dataType GrpcRequest {
     data: Buffer;          // raw (already de-framed) request message bytes
     metadata: []HpackHeader;
     deadlineMs: int;       // absolute deadline (ms since epoch); 0 if no deadline
+    peerCN: string;        // peer certificate Common Name (mTLS); "" if none
 }
 
 // A unary response returned by a server handler.
@@ -418,11 +422,13 @@ export class GrpcServerStream {
     var _respHeaders: []HpackHeader
     var _respTrailers: []HpackHeader
     var _respEncoding: string
+    var _peerCN: string
 
-    constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool) {
+    constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool, peerCN: string) {
         this._st = st
         this._method = method
         this._meta = meta
+        this._peerCN = peerCN
         this._headersSent = false
         this._deadlineMs = deadlineFromMeta(meta)
         this._cancelObserved = false
@@ -454,6 +460,12 @@ export class GrpcServerStream {
     // The request's user metadata (reserved/protocol headers removed).
     public requestMetadata(): Metadata {
         return metadataFromHeaders(this._meta)
+    }
+
+    // The peer certificate's Common Name when the connection is mutually
+    // authenticated (mTLS), or "" for plaintext / server-only TLS connections.
+    public peerCommonName(): string {
+        return this._peerCN
     }
 
     // The codec used for the client's request messages ("gzip" | "identity").
@@ -580,9 +592,15 @@ export class GrpcServer {
     var _compress: bool
 
     // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
-    // it back via addr().
-    constructor(host: string, port: int) {
-        this._server = new TcpServer(host, port)
+    // it back via addr(). Provide tlsOptions to serve over TLS/mTLS instead of
+    // cleartext h2c: {cert, key} for server TLS, plus {clientCA, requireClientCert}
+    // to require and verify client certificates (mutual TLS).
+    constructor(host: string, port: int, tlsOptions: any?) {
+        if (tlsOptions != null) {
+            this._server = new TlsServer(host, port, tlsOptions)
+        } else {
+            this._server = new TcpServer(host, port)
+        }
         this._handlers = {}
         this._kinds = {}
         this._compress = false
@@ -653,10 +671,13 @@ export class GrpcServer {
 function _serveConnSync(srv: GrpcServer, conn: TcpConnection): void {
     var h2: Http2Conn = new Http2Conn(conn, true)
     h2.serverHandshake()
+    // Read the peer's certificate identity only after the HTTP/2 preface has
+    // forced the TLS handshake to complete; "" for plaintext / server-only TLS.
+    var peerCN: string = conn.peerCommonName()
     h2.start()
     var st: Http2Stream? = h2.acceptStream()
     while (st != null) {
-        spawn _serveStream(srv, st)
+        spawn _serveStream(srv, st, peerCN)
         st = h2.acceptStream()
     }
 }
@@ -667,9 +688,9 @@ async function _serveConn(srv: GrpcServer, conn: TcpConnection): Task<void> {
 }
 
 // Dispatch a single accepted stream to its registered handler.
-async function _serveStream(srv: GrpcServer, st: Http2Stream): Task<void> {
+async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): Task<void> {
     var path: string = findHeader(st.initialMeta, ":path")
-    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta, srv._compress)
+    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta, srv._compress, peerCN)
 
     if (!srv._handlers.has(path)) {
         ss.finish(STATUS_UNIMPLEMENTED, "method not found: " + path)
@@ -686,7 +707,7 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream): Task<void> {
             if (m != null) {
                 reqData = m
             }
-            var req: GrpcRequest = { method: path, data: reqData, metadata: st.initialMeta, deadlineMs: ss.deadlineMs() }
+            var req: GrpcRequest = { method: path, data: reqData, metadata: st.initialMeta, deadlineMs: ss.deadlineMs(), peerCN: peerCN }
             var resp: GrpcResponse = handler(req)
             if (resp.status != STATUS_OK) {
                 ss.finish(resp.status, resp.message)
@@ -700,7 +721,7 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream): Task<void> {
             if (m2 != null) {
                 reqData2 = m2
             }
-            var req2: GrpcRequest = { method: path, data: reqData2, metadata: st.initialMeta, deadlineMs: ss.deadlineMs() }
+            var req2: GrpcRequest = { method: path, data: reqData2, metadata: st.initialMeta, deadlineMs: ss.deadlineMs(), peerCN: peerCN }
             handler(req2, ss)
             ss.finish(STATUS_OK, "")
         } else if (kind == RPC_CLIENT_STREAM) {
@@ -827,10 +848,16 @@ export class GrpcClient {
     var _authority: string
     var _encoding: string   // outbound request message codec ("gzip" | "identity")
 
-    // Connect over cleartext HTTP/2 (h2c), exchange the preface, and start the
-    // multiplexing reader/mux tasks.
-    constructor(host: string, port: int) {
-        this._conn = new TcpConnection(host, port)
+    // Connect over HTTP/2, exchange the preface, and start the multiplexing
+    // reader/mux tasks. Without tlsOptions this is cleartext h2c; pass tlsOptions
+    // to connect over TLS/mTLS: {ca} or {skipVerify} to trust the server, plus
+    // {cert, key} to present a client certificate (mutual TLS).
+    constructor(host: string, port: int, tlsOptions: any?) {
+        if (tlsOptions != null) {
+            this._conn = new TlsConnection(host, port, tlsOptions)
+        } else {
+            this._conn = new TcpConnection(host, port)
+        }
         this._authority = host + ":" + string(port)
         this._h2 = new Http2Conn(this._conn, false)
         this._h2.clientHandshake()

@@ -14,6 +14,7 @@ import {
     STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED
 } from "../src/index.chuks"
 import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
+import { tlsSelfSigned } from "std/net"
 
 var passed: any = 0
 var failed: any = 0
@@ -164,6 +165,13 @@ function bigHandler(req: GrpcRequest): GrpcResponse {
 // Run a single connection's worth of serving on a background task.
 async function runServer(srv: GrpcServer): Task<void> {
     srv.serveOnce()
+}
+
+// Unary handler that echoes the peer's mTLS certificate Common Name, so the
+// client can assert the server authenticated it (cn=chuks for our self-signed
+// cert, cn= for plaintext / server-only TLS).
+function peerHandler(req: GrpcRequest): GrpcResponse {
+    return grpcOk(encodeName("cn=" + req.peerCN))
 }
 
 // 1 — unary round-trip echo
@@ -540,6 +548,69 @@ try {
     await t19
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 19 gzip server-stream — " + string(e)) }
+
+// A self-signed cert/key/ca trio valid for localhost + 127.0.0.1 (CN=chuks),
+// reused by the TLS/mTLS cases below.
+var tlsCerts: any = tlsSelfSigned(["localhost", "127.0.0.1"])
+
+// 20 — TLS unary: gRPC over an encrypted channel (server TLS, client trusts CA)
+try {
+    var tlsSrvOpts20: any = { "cert": tlsCerts["cert"], "key": tlsCerts["key"] }
+    var srv20: GrpcServer = new GrpcServer("127.0.0.1", 0, tlsSrvOpts20)
+    srv20.register("/echo.Echo/Say", sayHandler)
+    var port20: int = portOf(srv20.addr())
+    var t20: Task<void> = spawn runServer(srv20)
+
+    var client20: GrpcClient = new GrpcClient("127.0.0.1", port20, { "ca": tlsCerts["ca"] })
+    var rep20: GrpcReply = client20.unary("/echo.Echo/Say", encodeName("tls"))
+    test.assertEqual(rep20.status, STATUS_OK)
+    test.assertEqual(decodeName(rep20.data), "hello, tls")
+    client20.close()
+    await t20
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 20 TLS unary — " + string(e)) }
+
+// 21 — mTLS: client presents a cert; server verifies it and reads its CN
+try {
+    var mtlsSrvOpts21: any = { "cert": tlsCerts["cert"], "key": tlsCerts["key"], "clientCA": tlsCerts["ca"], "requireClientCert": true }
+    var srv21: GrpcServer = new GrpcServer("127.0.0.1", 0, mtlsSrvOpts21)
+    srv21.register("/echo.Echo/Peer", peerHandler)
+    var port21: int = portOf(srv21.addr())
+    var t21: Task<void> = spawn runServer(srv21)
+
+    var mtlsCliOpts21: any = { "ca": tlsCerts["ca"], "cert": tlsCerts["cert"], "key": tlsCerts["key"] }
+    var client21: GrpcClient = new GrpcClient("127.0.0.1", port21, mtlsCliOpts21)
+    var rep21: GrpcReply = client21.unary("/echo.Echo/Peer", encodeName("x"))
+    test.assertEqual(rep21.status, STATUS_OK)
+    test.assertEqual(decodeName(rep21.data), "cn=chuks")
+    client21.close()
+    await t21
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 21 mTLS peer CN — " + string(e)) }
+
+// 22 — mTLS rejection: server requires a client cert; a client without one fails
+try {
+    var rejSrvOpts22: any = { "cert": tlsCerts["cert"], "key": tlsCerts["key"], "clientCA": tlsCerts["ca"], "requireClientCert": true }
+    var srv22: GrpcServer = new GrpcServer("127.0.0.1", 0, rejSrvOpts22)
+    srv22.register("/echo.Echo/Say", sayHandler)
+    var port22: int = portOf(srv22.addr())
+    var t22: Task<void> = spawn runServer(srv22)
+
+    var rejected22: bool = false
+    try {
+        // No client cert: the TLS handshake must fail. Depending on timing this
+        // surfaces either as a connect/handshake exception or as a non-OK reply
+        // once the broken transport is observed — both count as a rejection.
+        var client22: GrpcClient = new GrpcClient("127.0.0.1", port22, { "ca": tlsCerts["ca"] })
+        var rep22: GrpcReply = client22.unary("/echo.Echo/Say", encodeName("x"))
+        if (rep22.status != STATUS_OK) { rejected22 = true }
+        client22.close()
+    } catch (inner22) {
+        rejected22 = true
+    }
+    test.assertEqual(rejected22, true)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 22 mTLS rejection — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")
