@@ -75,6 +75,41 @@ export dataType GrpcReply {
     trailers: []HpackHeader;   // trailing response metadata (server trailers)
 }
 
+// ─── Retry policy ─────────────────────────────────────────────────────────
+// Client-side automatic retry configuration for unary calls. Each attempt is a
+// fresh RPC (new stream, interceptors re-run). Between attempts the client waits
+// `initialBackoffMs`, then multiplies the backoff by `backoffMultiplier` on each
+// subsequent retry, capped at `maxBackoffMs`. Only failures whose grpc-status is
+// in `retryableStatuses` are retried, up to `maxAttempts` total attempts.
+export dataType RetryPolicy {
+    maxAttempts: int;          // total attempts including the first (>= 1)
+    initialBackoffMs: int;     // delay before the first retry
+    maxBackoffMs: int;         // upper bound on any backoff delay
+    backoffMultiplier: int;    // backoff growth factor per retry (e.g. 2)
+    retryableStatuses: []int;  // grpc-status codes that trigger a retry
+}
+
+// A sensible default policy: up to 3 attempts, 100ms→2s exponential backoff,
+// retrying only UNAVAILABLE (transient connectivity) failures.
+export function defaultRetryPolicy(): RetryPolicy {
+    var codes: []int = [STATUS_UNAVAILABLE]
+    var p: RetryPolicy = { maxAttempts: 3, initialBackoffMs: 100, maxBackoffMs: 2000, backoffMultiplier: 2, retryableStatuses: codes }
+    return p
+}
+
+// True if `status` is one of the policy's retryable codes.
+function _isRetryable(policy: RetryPolicy, status: int): bool {
+    var codes: []int = policy.retryableStatuses
+    var i: int = 0
+    while (i < codes.length) {
+        if (codes[i] == status) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // ─── Convenience constructors ──────────────────────────────────────────────
 
 // Build a successful response from raw message bytes.
@@ -592,6 +627,8 @@ export class GrpcServer {
     var _compress: bool
     var _unaryInterceptors: []any   // function(req: GrpcRequest, next: any): GrpcResponse
     var _streamInterceptors: []any  // function(stream: GrpcServerStream, next: any): void
+    var _kaTime: int                // keepalive ping interval (ms; 0 = disabled)
+    var _kaTimeout: int             // keepalive ack timeout (ms)
 
     // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
     // it back via addr(). Provide tlsOptions to serve over TLS/mTLS instead of
@@ -608,6 +645,8 @@ export class GrpcServer {
         this._compress = false
         this._unaryInterceptors = []
         this._streamInterceptors = []
+        this._kaTime = 0
+        this._kaTimeout = 0
     }
 
     // Opt in to response compression. When enabled, responses are gzip-compressed
@@ -615,6 +654,14 @@ export class GrpcServer {
     // clients still receive identity (uncompressed) messages.
     public enableCompression(): void {
         this._compress = true
+    }
+
+    // Enable HTTP/2 keepalive for every accepted connection: each connection
+    // pings idle peers every `timeMs` and is dropped if no ACK returns within
+    // `timeoutMs`, reclaiming resources from half-open clients. Set before serve().
+    public enableKeepalive(timeMs: int, timeoutMs: int): void {
+        this._kaTime = timeMs
+        this._kaTimeout = timeoutMs
     }
 
     // Register a unary server interceptor. Interceptors run in registration
@@ -697,6 +744,9 @@ function _serveConnSync(srv: GrpcServer, conn: TcpConnection): void {
     // forced the TLS handshake to complete; "" for plaintext / server-only TLS.
     var peerCN: string = conn.peerCommonName()
     h2.start()
+    if (srv._kaTime > 0) {
+        h2.enableKeepalive(srv._kaTime, srv._kaTimeout)
+    }
     var st: Http2Stream? = h2.acceptStream()
     while (st != null) {
         spawn _serveStream(srv, st, peerCN)
@@ -930,6 +980,8 @@ export class GrpcClient {
     var _authority: string
     var _encoding: string   // outbound request message codec ("gzip" | "identity")
     var _unaryInterceptors: []any   // function(method: string, message: Buffer, md: Metadata, next: any): GrpcReply
+    var _retryEnabled: bool         // automatic unary retries on/off
+    var _retry: RetryPolicy         // active retry policy (default when disabled)
 
     // Connect over HTTP/2, exchange the preface, and start the multiplexing
     // reader/mux tasks. Without tlsOptions this is cleartext h2c; pass tlsOptions
@@ -947,11 +999,26 @@ export class GrpcClient {
         this._h2.start()
         this._encoding = ENCODING_IDENTITY
         this._unaryInterceptors = []
+        this._retryEnabled = false
+        this._retry = defaultRetryPolicy()
     }
 
     public close(): void {
         this._h2.close()
         this._conn.close()
+    }
+
+    // Enable HTTP/2 keepalive: ping the server every `timeMs` and tear the
+    // connection down if no PING ACK arrives within `timeoutMs` (in-flight calls
+    // then fail with UNAVAILABLE). Detects half-open / dead connections so calls
+    // fail fast instead of hanging. Call once after constructing the client.
+    public enableKeepalive(timeMs: int, timeoutMs: int): void {
+        this._h2.enableKeepalive(timeMs, timeoutMs)
+    }
+
+    // Diagnostics: number of keepalive PING ACKs received from the server so far.
+    public keepaliveAcks(): int {
+        return this._h2.pingAcks()
     }
 
     // Opt in to request compression. When set to "gzip", outbound request messages
@@ -971,6 +1038,21 @@ export class GrpcClient {
     // returning a GrpcReply without calling `next`.
     public useUnaryInterceptor(interceptor: any): void {
         this._unaryInterceptors.push(interceptor)
+    }
+
+    // Enable automatic retries for unary calls using `policy`. Each retry is a
+    // fresh attempt (new stream; interceptors re-run) issued after an exponential
+    // backoff, but only when the failure status is retryable. Retries apply to
+    // unary RPCs only — streaming calls are never retried automatically. Pass
+    // defaultRetryPolicy() for sensible defaults.
+    public setRetryPolicy(policy: RetryPolicy): void {
+        this._retry = policy
+        this._retryEnabled = true
+    }
+
+    // Disable automatic retries (the default).
+    public disableRetries(): void {
+        this._retryEnabled = false
     }
 
     // Open a raw stream for `method` (request HEADERS sent, body not yet).
@@ -1016,6 +1098,35 @@ export class GrpcClient {
     }
 
     private _unaryCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
+        if (!this._retryEnabled) {
+            return this._attemptUnary(method, message, md, timeoutMs)
+        }
+        var policy: RetryPolicy = this._retry
+        var attempt: int = 0
+        var backoff: int = policy.initialBackoffMs
+        while (true) {
+            var rep: GrpcReply = this._attemptUnary(method, message, md, timeoutMs)
+            attempt = attempt + 1
+            if (rep.status == STATUS_OK) {
+                return rep
+            }
+            if (attempt >= policy.maxAttempts) {
+                return rep
+            }
+            if (!_isRetryable(policy, rep.status)) {
+                return rep
+            }
+            time.sleep(backoff)
+            backoff = backoff * policy.backoffMultiplier
+            if (backoff > policy.maxBackoffMs) {
+                backoff = policy.maxBackoffMs
+            }
+        }
+    }
+
+    // Issue exactly one unary attempt: run the interceptor chain around a single
+    // direct RPC. Used both for non-retried calls and as one retry attempt.
+    private _attemptUnary(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
         var terminal = function(m: string, msg: Buffer, d: Metadata): GrpcReply {
             return this._unaryDirect(m, msg, d, timeoutMs)
         }

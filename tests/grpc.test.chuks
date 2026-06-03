@@ -11,7 +11,9 @@ import {
     GrpcServerStream, GrpcClientCall,
     Metadata, metadataFromHeaders,
     grpcOk, grpcError,
-    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED
+    RetryPolicy, defaultRetryPolicy,
+    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED,
+    STATUS_UNAVAILABLE, STATUS_INVALID_ARGUMENT
 } from "../src/index.chuks"
 import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
 import { tlsSelfSigned } from "std/net"
@@ -211,6 +213,35 @@ function wrapReply(method: string, message: Buffer, md: Metadata, next: any): Gr
 function tagStream(stream: GrpcServerStream, next: any): void {
     stream.setHeader("x-intercepted", "yes")
     next(stream)
+}
+
+// ── Retry fixtures (M13) ────────────────────────────────────────────────────
+// Per-test call counters (each test uses a fresh server, so a module-level
+// counter is reset explicitly before the test by assigning back to 0).
+var flaky29: any = 0
+var flaky30: any = 0
+var flaky31: any = 0
+
+// Fails the first two attempts with UNAVAILABLE, then succeeds — exercises a
+// retry that eventually recovers.
+function flakyHandler(req: GrpcRequest): GrpcResponse {
+    flaky29 = flaky29 + 1
+    if (flaky29 < 3) {
+        return grpcError(STATUS_UNAVAILABLE, "try again")
+    }
+    return grpcOk(encodeName("recovered"))
+}
+
+// Always fails with a non-retryable status; the client must NOT retry.
+function badArgHandler(req: GrpcRequest): GrpcResponse {
+    flaky30 = flaky30 + 1
+    return grpcError(STATUS_INVALID_ARGUMENT, "bad arg")
+}
+
+// Always fails with a retryable status; retries should be exhausted.
+function alwaysDownHandler(req: GrpcRequest): GrpcResponse {
+    flaky31 = flaky31 + 1
+    return grpcError(STATUS_UNAVAILABLE, "down")
 }
 
 // 1 — unary round-trip echo
@@ -744,6 +775,103 @@ try {
     await t27
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 27 server stream interceptor — " + string(e)) }
+
+// 28 — keepalive: client pings an idle connection and receives ACKs
+try {
+    var srv28: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv28.register("/echo.Echo/Say", sayHandler)
+    var port28: int = portOf(srv28.addr())
+    var t28: Task<void> = spawn runServer(srv28)
+
+    var client28: GrpcClient = new GrpcClient("127.0.0.1", port28)
+    // Warm the connection, then idle while keepalive pings fly.
+    var pre28: GrpcReply = client28.unary("/echo.Echo/Say", encodeName("ping"))
+    test.assertEqual(pre28.status, STATUS_OK)
+    client28.enableKeepalive(50, 1000)
+    time.sleep(220)
+    test.assert(client28.keepaliveAcks() >= 1)
+    // Connection is still healthy for real RPCs after keepalive activity.
+    var post28: GrpcReply = client28.unary("/echo.Echo/Say", encodeName("again"))
+    test.assertEqual(post28.status, STATUS_OK)
+    test.assertEqual(decodeName(post28.data), "hello, again")
+    client28.close()
+    await t28
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 28 keepalive liveness — " + string(e)) }
+
+// 29 — retry recovers: handler fails twice (UNAVAILABLE) then succeeds
+try {
+    flaky29 = 0
+    var srv29: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv29.register("/echo.Echo/Flaky", flakyHandler)
+    var port29: int = portOf(srv29.addr())
+    var t29: Task<void> = spawn runServer(srv29)
+
+    var client29: GrpcClient = new GrpcClient("127.0.0.1", port29)
+    var pol29: RetryPolicy = { maxAttempts: 5, initialBackoffMs: 5, maxBackoffMs: 50, backoffMultiplier: 2, retryableStatuses: [STATUS_UNAVAILABLE] }
+    client29.setRetryPolicy(pol29)
+    var rep29: GrpcReply = client29.unary("/echo.Echo/Flaky", encodeName("x"))
+    test.assertEqual(rep29.status, STATUS_OK)
+    test.assertEqual(decodeName(rep29.data), "recovered")
+    test.assertEqual(flaky29, 3)
+    client29.close()
+    await t29
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 29 retry recovers — " + string(e)) }
+
+// 30 — non-retryable status is not retried (handler runs exactly once)
+try {
+    flaky30 = 0
+    var srv30: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv30.register("/echo.Echo/Bad", badArgHandler)
+    var port30: int = portOf(srv30.addr())
+    var t30: Task<void> = spawn runServer(srv30)
+
+    var client30: GrpcClient = new GrpcClient("127.0.0.1", port30)
+    client30.setRetryPolicy(defaultRetryPolicy())
+    var rep30: GrpcReply = client30.unary("/echo.Echo/Bad", encodeName("x"))
+    test.assertEqual(rep30.status, STATUS_INVALID_ARGUMENT)
+    test.assertEqual(flaky30, 1)
+    client30.close()
+    await t30
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 30 non-retryable not retried — " + string(e)) }
+
+// 31 — retries exhausted: returns the last (retryable) error after maxAttempts
+try {
+    flaky31 = 0
+    var srv31: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv31.register("/echo.Echo/Down", alwaysDownHandler)
+    var port31: int = portOf(srv31.addr())
+    var t31: Task<void> = spawn runServer(srv31)
+
+    var client31: GrpcClient = new GrpcClient("127.0.0.1", port31)
+    var pol31: RetryPolicy = { maxAttempts: 3, initialBackoffMs: 5, maxBackoffMs: 50, backoffMultiplier: 2, retryableStatuses: [STATUS_UNAVAILABLE] }
+    client31.setRetryPolicy(pol31)
+    var rep31: GrpcReply = client31.unary("/echo.Echo/Down", encodeName("x"))
+    test.assertEqual(rep31.status, STATUS_UNAVAILABLE)
+    test.assertEqual(flaky31, 3)
+    client31.close()
+    await t31
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 31 retries exhausted — " + string(e)) }
+
+// 32 — retries are disabled by default (a retryable failure runs once)
+try {
+    flaky31 = 0
+    var srv32: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv32.register("/echo.Echo/Down", alwaysDownHandler)
+    var port32: int = portOf(srv32.addr())
+    var t32: Task<void> = spawn runServer(srv32)
+
+    var client32: GrpcClient = new GrpcClient("127.0.0.1", port32)
+    var rep32: GrpcReply = client32.unary("/echo.Echo/Down", encodeName("x"))
+    test.assertEqual(rep32.status, STATUS_UNAVAILABLE)
+    test.assertEqual(flaky31, 1)
+    client32.close()
+    await t32
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 32 retries disabled by default — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

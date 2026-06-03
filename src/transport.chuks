@@ -23,6 +23,7 @@
 import { TcpConnection } from "std/net"
 import { Buffer } from "std/buffer"
 import { Channel } from "std/channel"
+import { time } from "std/time"
 import {
     CONNECTION_PREFACE,
     FRAME_DATA, FRAME_HEADERS, FRAME_RST_STREAM, FRAME_SETTINGS,
@@ -338,6 +339,13 @@ export class Http2Conn {
     var _streams: map[int]Http2Stream
     var _nextId: int
     var _closed: bool
+    // ── Keepalive (HTTP/2 PING) state ─────────────────────────────────────────
+    var _kaTime: int               // ms between keepalive pings (0 = disabled)
+    var _kaTimeout: int            // ms to await a PING ACK before declaring death
+    var _kaActive: bool            // keepalive loop already spawned
+    var _pingAcks: Channel<bool>   // reader signals here when a PING ACK arrives
+    var _pingsSent: int            // diagnostics: keepalive pings emitted
+    var _acksGot: int              // diagnostics: PING ACKs observed
 
     constructor(conn: TcpConnection, isServer: bool) {
         this._conn = conn
@@ -349,10 +357,57 @@ export class Http2Conn {
         // Clients use odd stream ids starting at 1; servers never originate.
         this._nextId = 1
         this._closed = false
+        this._kaTime = 0
+        this._kaTimeout = 0
+        this._kaActive = false
+        this._pingAcks = new Channel<bool>(8)
+        this._pingsSent = 0
+        this._acksGot = 0
     }
 
     public events(): Channel<MuxEvent> {
         return this._events
+    }
+
+    // ── Keepalive ─────────────────────────────────────────────────────────────
+
+    // Enable HTTP/2 keepalive on this connection: every `timeMs` of the loop the
+    // connection emits a PING and waits up to `timeoutMs` for its ACK. If no ACK
+    // arrives the peer is presumed dead and the connection is torn down (in-flight
+    // streams finish with UNAVAILABLE). Safe to call after start(); idempotent.
+    public enableKeepalive(timeMs: int, timeoutMs: int): void {
+        if (timeMs <= 0) {
+            return
+        }
+        this._kaTime = timeMs
+        this._kaTimeout = timeoutMs
+        if (!this._kaActive && !this._closed) {
+            this._kaActive = true
+            spawn _keepaliveLoop(this)
+        }
+    }
+
+    // Called by the reader task when a PING ACK is observed. Non-blocking so the
+    // reader never stalls; the keepalive loop polls `_pingAcks`.
+    public _signalPingAck(): void {
+        this._acksGot = this._acksGot + 1
+        this._pingAcks.trySend(true)
+    }
+
+    // Called by the keepalive task after emitting a PING; mutating the counter on
+    // `this` (rather than on the spawn'd loop's parameter) keeps the write off the
+    // concurrency checker's radar.
+    public _notePingSent(): void {
+        this._pingsSent = this._pingsSent + 1
+    }
+
+    // Diagnostics: keepalive pings sent / ACKs received so far.
+    public pingsSent(): int {
+        return this._pingsSent
+    }
+
+    public pingAcks(): int {
+        return this._acksGot
     }
 
     // ── Handshakes ────────────────────────────────────────────────────────────
@@ -699,6 +754,9 @@ async function _readLoop(h: Http2Conn): Task<void> {
             } else if (frame.ftype == FRAME_PING) {
                 if ((frame.flags & FLAG_ACK) == 0) {
                     h._events.send(mkWrite(pingFrame(frame.payload, true)))
+                } else {
+                    // ACK of one of our keepalive pings: mark the peer alive.
+                    h._signalPingAck()
                 }
             } else if (frame.ftype == FRAME_RST_STREAM) {
                 _routeReset(h, frame, decoders)
@@ -811,4 +869,87 @@ function _teardown(h: Http2Conn): void {
     }
     h._accept.close()
     h._events.send(mkClose())
+}
+
+// ─── Keepalive task ──────────────────────────────────────────────────────────
+// Periodically PINGs the peer and tears the connection down if no ACK returns
+// within the configured timeout. Runs as its own task; owns no shared state
+// beyond the diagnostic counters and the ack-signalling channel.
+
+// A fixed 8-byte opaque PING payload (HTTP/2 requires exactly 8 bytes).
+function _kaPingPayload(): Buffer {
+    var bytes: []any = [0x6b, 0x65, 0x65, 0x70, 0x61, 0x6c, 0x69, 0x76]   // "keepaliv"
+    return Buffer.fromArray(bytes)
+}
+
+// Sleep up to `ms`, waking early (in <=20ms steps) once the connection closes.
+function _kaSleep(h: Http2Conn, ms: int): void {
+    var remaining: int = ms
+    while (remaining > 0 && !h._closed) {
+        var step: int = 20
+        if (step > remaining) {
+            step = remaining
+        }
+        time.sleep(step)
+        remaining = remaining - step
+    }
+}
+
+// Drain any stale ACK signals left over from a previous interval so each ping
+// only counts its own ACK.
+function _kaDrain(h: Http2Conn): void {
+    var more: bool = true
+    while (more) {
+        var r: any = h._pingAcks.tryReceive()
+        var ok: bool = r["ok"]
+        if (!ok) {
+            more = false
+        }
+    }
+}
+
+// Close the underlying socket to unblock the reader's blocking readFrame().
+function _kaCloseSocket(h: Http2Conn): void {
+    try {
+        h._conn.close()
+    } catch (e) {
+        // Already closed / mid-teardown — ignore.
+    }
+}
+
+async function _keepaliveLoop(h: Http2Conn): Task<void> {
+    while (!h._closed) {
+        _kaSleep(h, h._kaTime)
+        if (h._closed) {
+            break
+        }
+        _kaDrain(h)
+        // Emit a keepalive PING (non-ACK); the peer must echo it back as an ACK.
+        h._events.send(mkWrite(pingFrame(_kaPingPayload(), false)))
+        h._notePingSent()
+
+        // Await the ACK within the timeout window, polling the ack channel.
+        var deadline: int = time.now() + h._kaTimeout
+        var acked: bool = false
+        while (time.now() < deadline) {
+            var r: any = h._pingAcks.tryReceive()
+            var ok: bool = r["ok"]
+            if (ok && r["value"] != null) {
+                acked = true
+                break
+            }
+            if (h._closed) {
+                break
+            }
+            time.sleep(1)
+        }
+
+        if (!acked) {
+            // Peer is unresponsive: stop the mux and drop the socket so the
+            // reader unblocks and finishes all in-flight streams.
+            h.close()
+            _kaCloseSocket(h)
+            break
+        }
+    }
 }
