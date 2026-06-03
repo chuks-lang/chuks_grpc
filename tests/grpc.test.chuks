@@ -16,6 +16,7 @@ import {
     HealthService, HealthClient, registerHealthService,
     SERVING_SERVING, SERVING_NOT_SERVING, SERVING_SERVICE_UNKNOWN,
     ReflectionService, ReflectionClient, registerReflectionService,
+    RpcStats,
     STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED,
     STATUS_UNAVAILABLE, STATUS_INVALID_ARGUMENT
 } from "../src/index.chuks"
@@ -1188,6 +1189,128 @@ try {
     await t42
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 42 reflection unsupported query — " + string(e)) }
+
+// ── Stats / tracing hooks (M17) ─────────────────────────────────────────────
+
+// Unary handler that always fails, to verify the failing status reaches stats.
+function statsFailHandler(req: GrpcRequest): GrpcResponse {
+    return grpcError(STATUS_INVALID_ARGUMENT, "nope")
+}
+
+// 43 — a server stats handler observes every completed unary RPC
+try {
+    var srv43: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv43.register("/echo.Echo/Say", sayHandler)
+    var statsCh43: Channel<RpcStats> = new Channel<RpcStats>(4)
+    srv43.useStatsHandler(function(s: RpcStats): void {
+        statsCh43.send(s)
+    })
+    var port43: int = portOf(srv43.addr())
+    var t43: Task<void> = spawn runServer(srv43)
+
+    var client43: GrpcClient = new GrpcClient("127.0.0.1", port43)
+    var rep43: GrpcReply = client43.unary("/echo.Echo/Say", encodeName("stats"))
+    test.assertEqual(rep43.status, STATUS_OK)
+
+    var got43: RpcStats? = statsCh43.receive()
+    test.assert(got43 != null)
+    if (got43 != null) {
+        test.assertEqual(got43.method, "/echo.Echo/Say")
+        test.assertEqual(got43.status, STATUS_OK)
+        test.assert(!got43.isClient)
+        test.assert(got43.durationMs >= 0)
+        test.assert(got43.endMs >= got43.startMs)
+    }
+    client43.close()
+    await t43
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 43 server unary stats — " + string(e)) }
+
+// 44 — server stats reports the handler's non-OK status
+try {
+    var srv44: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv44.register("/echo.Echo/Fail", statsFailHandler)
+    var statsCh44: Channel<RpcStats> = new Channel<RpcStats>(4)
+    srv44.useStatsHandler(function(s: RpcStats): void {
+        statsCh44.send(s)
+    })
+    var port44: int = portOf(srv44.addr())
+    var t44: Task<void> = spawn runServer(srv44)
+
+    var client44: GrpcClient = new GrpcClient("127.0.0.1", port44)
+    var rep44: GrpcReply = client44.unary("/echo.Echo/Fail", encodeName("x"))
+    test.assertEqual(rep44.status, STATUS_INVALID_ARGUMENT)
+
+    var got44: RpcStats? = statsCh44.receive()
+    test.assert(got44 != null)
+    if (got44 != null) {
+        test.assertEqual(got44.method, "/echo.Echo/Fail")
+        test.assertEqual(got44.status, STATUS_INVALID_ARGUMENT)
+        test.assert(!got44.isClient)
+    }
+    client44.close()
+    await t44
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 44 server error stats — " + string(e)) }
+
+// 45 — a client stats handler observes the outgoing unary call
+try {
+    var srv45: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv45.register("/echo.Echo/Say", sayHandler)
+    var port45: int = portOf(srv45.addr())
+    var t45: Task<void> = spawn runServer(srv45)
+
+    var client45: GrpcClient = new GrpcClient("127.0.0.1", port45)
+    var statsCh45: Channel<RpcStats> = new Channel<RpcStats>(4)
+    client45.useStatsHandler(function(s: RpcStats): void {
+        statsCh45.send(s)
+    })
+    var rep45: GrpcReply = client45.unary("/echo.Echo/Say", encodeName("hi"))
+    test.assertEqual(rep45.status, STATUS_OK)
+
+    var got45: RpcStats? = statsCh45.receive()
+    test.assert(got45 != null)
+    if (got45 != null) {
+        test.assertEqual(got45.method, "/echo.Echo/Say")
+        test.assertEqual(got45.status, STATUS_OK)
+        test.assert(got45.isClient)
+        test.assert(got45.durationMs >= 0)
+    }
+    client45.close()
+    await t45
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 45 client unary stats — " + string(e)) }
+
+// 46 — server stats fire for streaming RPCs too (status via finishStatus)
+try {
+    var srv46: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv46.registerServerStream("/echo.Echo/Count", countHandler)
+    var statsCh46: Channel<RpcStats> = new Channel<RpcStats>(4)
+    srv46.useStatsHandler(function(s: RpcStats): void {
+        statsCh46.send(s)
+    })
+    var port46: int = portOf(srv46.addr())
+    var t46: Task<void> = spawn runServer(srv46)
+
+    var client46: GrpcClient = new GrpcClient("127.0.0.1", port46)
+    var call46: GrpcClientCall = client46.serverStream("/echo.Echo/Count", encodeName("n"))
+    var msg46: Buffer? = call46.recv()
+    while (msg46 != null) {
+        msg46 = call46.recv()
+    }
+    call46.result()
+
+    var got46: RpcStats? = statsCh46.receive()
+    test.assert(got46 != null)
+    if (got46 != null) {
+        test.assertEqual(got46.method, "/echo.Echo/Count")
+        test.assertEqual(got46.status, STATUS_OK)
+        test.assert(!got46.isClient)
+    }
+    client46.close()
+    await t46
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 46 server stream stats — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

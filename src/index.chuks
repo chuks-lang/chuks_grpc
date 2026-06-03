@@ -459,12 +459,14 @@ export class GrpcServerStream {
     var _respTrailers: []HpackHeader
     var _respEncoding: string
     var _peerCN: string
+    var _finishStatus: int   // terminal grpc-status sent by finish(); STATUS_OK until then
 
     constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool, peerCN: string) {
         this._st = st
         this._method = method
         this._meta = meta
         this._peerCN = peerCN
+        this._finishStatus = STATUS_OK
         this._headersSent = false
         this._deadlineMs = deadlineFromMeta(meta)
         this._cancelObserved = false
@@ -606,8 +608,16 @@ export class GrpcServerStream {
         sendEncoded(this._st, data, this._respEncoding)
     }
 
+    // The terminal grpc-status this stream finished with (STATUS_OK until
+    // finish() is called). Used by the server stats hooks (M17) to report the
+    // outcome of streaming RPCs.
+    public finishStatus(): int {
+        return this._finishStatus
+    }
+
     // Finish the RPC with a status and message (sends trailers, ends stream).
     public finish(status: int, message: string): void {
+        this._finishStatus = status
         this._ensureHeaders()
         var trailers: []HpackHeader = [hdr("grpc-status", string(status)), hdr("grpc-message", message)]
         var i: int = 0
@@ -619,6 +629,22 @@ export class GrpcServerStream {
     }
 }
 
+// A completed-RPC observation handed to every registered stats handler (M17)
+// once a call finishes. Stats handlers are passive observers — they receive a
+// snapshot and must not mutate the RPC. The same shape is used on both the
+// server (isClient = false) and client (isClient = true) so a single handler
+// type works on either side, making it easy to feed metrics counters or build
+// a tracing span from start/end timestamps.
+export dataType RpcStats {
+    method: string      // full method path, e.g. "/pkg.Service/Method"
+    isClient: bool      // true for client-side stats, false for server-side
+    status: int         // terminal grpc-status code (STATUS_OK == success)
+    startMs: int        // RPC start time (ms since epoch)
+    endMs: int          // RPC end time (ms since epoch)
+    durationMs: int     // endMs - startMs convenience field
+    peerCN: string      // mTLS peer Common Name on the server side, else ""
+}
+
 // ─── Server ────────────────────────────────────────────────────────────────
 
 export class GrpcServer {
@@ -628,6 +654,7 @@ export class GrpcServer {
     var _compress: bool
     var _unaryInterceptors: []any   // function(req: GrpcRequest, next: any): GrpcResponse
     var _streamInterceptors: []any  // function(stream: GrpcServerStream, next: any): void
+    var _statsHandlers: []any       // function(stats: RpcStats): void — fired per finished RPC
     var _kaTime: int                // keepalive ping interval (ms; 0 = disabled)
     var _kaTimeout: int             // keepalive ack timeout (ms)
 
@@ -646,6 +673,7 @@ export class GrpcServer {
         this._compress = false
         this._unaryInterceptors = []
         this._streamInterceptors = []
+        this._statsHandlers = []
         this._kaTime = 0
         this._kaTimeout = 0
     }
@@ -681,6 +709,18 @@ export class GrpcServer {
         // not call `next`) is responsible for finishing the stream itself.
     public useStreamInterceptor(interceptor: any): void {
         this._streamInterceptors.push(interceptor)
+    }
+
+    // Register a stats/tracing observer invoked once for every RPC this server
+    // handles, after the call finishes (including methods that are not found):
+    //   function(stats: RpcStats): void
+    // Handlers run in registration order and receive a read-only RpcStats
+    // snapshot (method, status, start/end/duration, peer CN). Use them to feed
+    // metrics counters/histograms or to record a completed tracing span. A
+    // throwing handler must not interfere with the RPC, so keep them cheap and
+    // non-blocking.
+    public useStatsHandler(handler: any): void {
+        this._statsHandlers.push(handler)
     }
 
     // Register a unary handler:
@@ -783,11 +823,15 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
 
     if (!srv._handlers.has(path)) {
         ss.finish(STATUS_UNIMPLEMENTED, "method not found: " + path)
+        _emitServerStats(srv, path, peerCN, time.now(), STATUS_UNIMPLEMENTED)
         return
     }
 
     var kind: int = srv._kinds[path]
     var handler: any = srv._handlers[path]
+
+    var _statStart: int = time.now()
+    var _statStatus: int = STATUS_OK
 
     try {
         if (kind == RPC_UNARY) {
@@ -807,6 +851,7 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
                 ss.send(resp.data)
                 ss.finish(STATUS_OK, "")
             }
+            _statStatus = resp.status
         } else if (kind == RPC_SERVER_STREAM) {
             var reqData2: Buffer = emptyBuf()
             var m2: Buffer? = ss.recv()
@@ -819,6 +864,7 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
                 s.finish(STATUS_OK, "")
             }
             _runServerStream(srv._streamInterceptors, 0, ss, ssTerminal)
+            _statStatus = ss.finishStatus()
         } else if (kind == RPC_CLIENT_STREAM) {
             var csTerminal = function(s: GrpcServerStream): void {
                 var resp3: GrpcResponse = handler(s)
@@ -830,15 +876,44 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
                 }
             }
             _runServerStream(srv._streamInterceptors, 0, ss, csTerminal)
+            _statStatus = ss.finishStatus()
         } else {
             var bidiTerminal = function(s: GrpcServerStream): void {
                 handler(s)
                 s.finish(STATUS_OK, "")
             }
             _runServerStream(srv._streamInterceptors, 0, ss, bidiTerminal)
+            _statStatus = ss.finishStatus()
         }
     } catch (e) {
         ss.finish(STATUS_INTERNAL, string(e))
+        _statStatus = STATUS_INTERNAL
+    }
+
+    _emitServerStats(srv, path, peerCN, _statStart, _statStatus)
+}
+
+// Build an RpcStats snapshot for a finished server RPC and hand it to every
+// registered stats handler in order. A no-op when no handlers are registered.
+function _emitServerStats(srv: GrpcServer, method: string, peerCN: string, startMs: int, status: int): void {
+    if (srv._statsHandlers.length == 0) {
+        return
+    }
+    var endMs: int = time.now()
+    var stats: RpcStats = {
+        method: method,
+        isClient: false,
+        status: status,
+        startMs: startMs,
+        endMs: endMs,
+        durationMs: endMs - startMs,
+        peerCN: peerCN
+    }
+    var i: int = 0
+    while (i < srv._statsHandlers.length) {
+        var h: any = srv._statsHandlers[i]
+        h(stats)
+        i = i + 1
     }
 }
 
@@ -997,6 +1072,7 @@ export class GrpcClient {
     var _authority: string
     var _encoding: string   // outbound request message codec ("gzip" | "identity")
     var _unaryInterceptors: []any   // function(method: string, message: Buffer, md: Metadata, next: any): GrpcReply
+    var _statsHandlers: []any       // function(stats: RpcStats): void — fired per finished unary call
     var _retryEnabled: bool         // automatic unary retries on/off
     var _retry: RetryPolicy         // active retry policy (default when disabled)
 
@@ -1016,6 +1092,7 @@ export class GrpcClient {
         this._h2.start()
         this._encoding = ENCODING_IDENTITY
         this._unaryInterceptors = []
+        this._statsHandlers = []
         this._retryEnabled = false
         this._retry = defaultRetryPolicy()
     }
@@ -1055,6 +1132,16 @@ export class GrpcClient {
     // returning a GrpcReply without calling `next`.
     public useUnaryInterceptor(interceptor: any): void {
         this._unaryInterceptors.push(interceptor)
+    }
+
+    // Register a stats/tracing observer invoked once per unary call, after it
+    // finishes (a retried call reports its final outcome as a single event):
+    //   function(stats: RpcStats): void
+    // Handlers run in registration order with a read-only RpcStats snapshot
+    // (isClient = true; peerCN is "" on the client). Use them for client-side
+    // latency/error metrics or to record an outgoing tracing span.
+    public useStatsHandler(handler: any): void {
+        this._statsHandlers.push(handler)
     }
 
     // Enable automatic retries for unary calls using `policy`. Each retry is a
@@ -1115,6 +1202,31 @@ export class GrpcClient {
     }
 
     private _unaryCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
+        if (this._statsHandlers.length == 0) {
+            return this._unaryCoreInner(method, message, md, timeoutMs)
+        }
+        var startMs: int = time.now()
+        var rep: GrpcReply = this._unaryCoreInner(method, message, md, timeoutMs)
+        var endMs: int = time.now()
+        var stats: RpcStats = {
+            method: method,
+            isClient: true,
+            status: rep.status,
+            startMs: startMs,
+            endMs: endMs,
+            durationMs: endMs - startMs,
+            peerCN: ""
+        }
+        var i: int = 0
+        while (i < this._statsHandlers.length) {
+            var h: any = this._statsHandlers[i]
+            h(stats)
+            i = i + 1
+        }
+        return rep
+    }
+
+    private _unaryCoreInner(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
         if (!this._retryEnabled) {
             return this._attemptUnary(method, message, md, timeoutMs)
         }
