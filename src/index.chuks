@@ -209,6 +209,7 @@ export class GrpcServerStream {
     var _meta: []HpackHeader
     var _headersSent: bool
     var _deadlineMs: int
+    var _cancelObserved: bool
 
     constructor(st: Http2Stream, method: string, meta: []HpackHeader) {
         this._st = st
@@ -216,6 +217,7 @@ export class GrpcServerStream {
         this._meta = meta
         this._headersSent = false
         this._deadlineMs = deadlineFromMeta(meta)
+        this._cancelObserved = false
     }
 
     // The full method path, e.g. "/package.Service/Method".
@@ -240,6 +242,26 @@ export class GrpcServerStream {
             return false
         }
         return time.now() >= this._deadlineMs
+    }
+
+    // True once the client has cancelled the RPC (RST_STREAM) or the deadline
+    // has elapsed. Long-running streaming handlers should poll this and return
+    // promptly so work isn't wasted on an abandoned call. The cancellation is
+    // observed via the stream's one-shot terminal signal (delivered by the
+    // transport reader on reset) and memoised here.
+    public cancelled(): bool {
+        if (this._cancelObserved) {
+            return true
+        }
+        if (this.deadlineExceeded()) {
+            return true
+        }
+        var end: Http2StreamEnd? = this._st.tryResult()
+        if (end != null) {
+            this._cancelObserved = true
+            return true
+        }
+        return false
     }
 
     // Receive the next request message, or null once the client half-closes.
@@ -419,16 +441,35 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream): Task<void> {
 export class GrpcClientCall {
     var _st: Http2Stream
     var _deadlineMs: int   // absolute deadline (ms since epoch); 0 = none
+    var _cancelled: bool   // set by cancel()
 
     constructor(st: Http2Stream) {
         this._st = st
         this._deadlineMs = 0
+        this._cancelled = false
     }
 
     // Attach an absolute deadline (ms since epoch). Called by the client openers
     // when a per-call timeout was requested.
     public _setDeadline(absMs: int): void {
         this._deadlineMs = absMs
+    }
+
+    // Cancel the RPC: send RST_STREAM(CANCEL) to the server so it can stop work
+    // (the server handler observes this via GrpcServerStream.cancelled()). A
+    // subsequent result() on this call returns STATUS_CANCELLED immediately.
+    // Call cancel() from the same task that drives the call.
+    public cancel(): void {
+        if (this._cancelled) {
+            return
+        }
+        this._cancelled = true
+        this._st.reset(ERR_CANCEL)
+    }
+
+    // True once cancel() has been called on this call.
+    public isCancelled(): bool {
+        return this._cancelled
     }
 
     // Send one request message on the stream.
@@ -454,6 +495,10 @@ export class GrpcClientCall {
     // set, polls so the call cannot hang past it: on expiry the stream is reset
     // and a DEADLINE_EXCEEDED reply is returned.
     public result(): GrpcReply {
+        if (this._cancelled) {
+            var cr: GrpcReply = { data: emptyBuf(), status: STATUS_CANCELLED, message: "call cancelled" }
+            return cr
+        }
         if (this._deadlineMs == 0) {
             var end: Http2StreamEnd = this._st.result()
             var reply: GrpcReply = { data: emptyBuf(), status: end.status, message: end.message }

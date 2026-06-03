@@ -148,6 +148,7 @@ export class Http2Stream {
     var _sendClosed: bool
     var _inClosed: bool
     var _doneSent: bool
+    var _resetSent: bool
 
     constructor(id: int, events: Channel<MuxEvent>) {
         this.id = id
@@ -158,6 +159,7 @@ export class Http2Stream {
         this._sendClosed = false
         this._inClosed = false
         this._doneSent = false
+        this._resetSent = false
     }
 
     // Idempotently close the inbound side (peer half-closed / reset / teardown).
@@ -261,11 +263,14 @@ export class Http2Stream {
         this._events.send(ev)
     }
 
-    // Abort the stream with RST_STREAM(code).
+    // Abort the stream with RST_STREAM(code). Valid even after the send side has
+    // been half-closed (closeSend/sendTrailers): cancellation is a forceful
+    // abort, not an orderly close. Idempotent via its own flag.
     public reset(code: int): void {
-        if (this._sendClosed) {
+        if (this._resetSent) {
             return
         }
+        this._resetSent = true
         this._sendClosed = true
         var ev: MuxEvent = mkWrite(rstStreamFrame(this.id, code))
         this._events.send(ev)
@@ -761,11 +766,10 @@ function _routeData(h: Http2Conn, frame: Http2Frame, decoders: map[int]GrpcFrame
     }
     if ((frame.flags & FLAG_END_STREAM) != 0) {
         st._closeInbound()
-        if (h._isServer) {
-            // Bound the stream table; the handler holds its own reference.
-            h._streams.delete(frame.streamId)
-            decoders.delete(frame.streamId)
-        }
+        // Keep the stream in the routing table even after the request half
+        // closes: the server still owns the response direction, and a later
+        // RST_STREAM (client cancellation) must reach this stream. The table is
+        // bounded by connection teardown.
     }
 }
 

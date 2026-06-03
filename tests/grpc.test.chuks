@@ -5,11 +5,12 @@
 import { test } from "std/test"
 import { Buffer } from "std/buffer"
 import { time } from "std/time"
+import { Channel } from "std/channel"
 import {
     GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
     GrpcServerStream, GrpcClientCall,
     grpcOk,
-    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED
+    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED
 } from "../src/index.chuks"
 import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
 
@@ -106,6 +107,25 @@ function deadlineEchoHandler(req: GrpcRequest): GrpcResponse {
         return grpcOk(encodeName("has-deadline"))
     }
     return grpcOk(encodeName("no-deadline"))
+}
+
+// Signals out of the cancel-watch handler whether it observed cancellation.
+var cancelSignal: Channel<bool> = new Channel<bool>(1)
+
+// Server-streaming handler that emits "started", then polls for cancellation
+// and reports (true once the client cancels, false if it times out waiting).
+function watchHandler(req: GrpcRequest, stream: GrpcServerStream): void {
+    stream.send(encodeName("started"))
+    var i: int = 0
+    while (i < 2000) {
+        if (stream.cancelled()) {
+            cancelSignal.send(true)
+            return
+        }
+        time.sleep(2)
+        i = i + 1
+    }
+    cancelSignal.send(false)
 }
 
 // Run a single connection's worth of serving on a background task.
@@ -282,6 +302,46 @@ try {
     await t9
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 9 server deadline header — " + string(e)) }
+
+// 10 — server observes client cancellation via stream.cancelled()
+try {
+    var srv10: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv10.registerServerStream("/echo.Echo/Watch", watchHandler)
+    var port10: int = portOf(srv10.addr())
+    var t10: Task<void> = spawn runServer(srv10)
+
+    var client10: GrpcClient = new GrpcClient("127.0.0.1", port10)
+    var call10: GrpcClientCall = client10.serverStream("/echo.Echo/Watch", encodeName("go"))
+    var first10: Buffer? = call10.recv()
+    var firstName10: string = ""
+    if (first10 != null) { firstName10 = decodeName(first10) }
+    test.assertEqual(firstName10, "started")
+    call10.cancel()
+    var saw10: bool? = cancelSignal.receive()
+    test.assertEqual(saw10, true)
+    client10.close()
+    await t10
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 10 server observes cancel — " + string(e)) }
+
+// 11 — client cancel(): result() returns CANCELLED promptly
+try {
+    var srv11: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv11.registerServerStream("/echo.Echo/Watch", watchHandler)
+    var port11: int = portOf(srv11.addr())
+    var t11: Task<void> = spawn runServer(srv11)
+
+    var client11: GrpcClient = new GrpcClient("127.0.0.1", port11)
+    var call11: GrpcClientCall = client11.serverStream("/echo.Echo/Watch", encodeName("go"))
+    var first11: Buffer? = call11.recv()
+    call11.cancel()
+    var rep11: GrpcReply = call11.result()
+    test.assertEqual(rep11.status, STATUS_CANCELLED)
+    var sig11: bool? = cancelSignal.receive()   // let the handler drain & exit
+    client11.close()
+    await t11
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 11 client cancel result — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")
