@@ -4,29 +4,25 @@
 // message framing (framing.chuks) and Protocol Buffers (protobuf.chuks).
 //
 // This implements gRPC over cleartext HTTP/2 ("h2c", a.k.a. prior-knowledge
-// HTTP/2). It interoperates with standard tooling that speaks plaintext gRPC,
+    // HTTP/2). It interoperates with standard tooling that speaks plaintext gRPC,
 // e.g. `grpcurl -plaintext`, Go's `grpc.WithTransportCredentials(insecure...)`,
 // and Java's `usePlaintext()`.
 //
-// Scope of v1:
-//   • Unary RPCs (one request message → one response message).
-//   • Single HEADERS frame per header block (no CONTINUATION).
-//   • No built-in TLS server (std/net exposes a plaintext listener only).
+// Scope:
+//   • All four RPC types: unary, server-streaming, client-streaming, bidi.
+//   • Full HTTP/2 multiplexing, flow control and CONTINUATION via the actor-
+//     model transport (transport.chuks): a per-connection mux + reader task.
+//   • No built-in TLS server yet (std/net exposes a plaintext listener only).
 //   • No .proto codegen — you serialize/deserialize with ProtoWriter/Reader.
 // ───────────────────────────────────────────────────────────────────────────
 
 import { TcpConnection, TcpServer } from "std/net"
 import { Buffer } from "std/buffer"
-import {
-    CONNECTION_PREFACE,
-    FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, FRAME_PING,
-    FRAME_GOAWAY, FRAME_RST_STREAM, FRAME_WINDOW_UPDATE,
-    FLAG_END_STREAM, FLAG_ACK,
-    Http2Frame, Http2Setting,
-    settingsFrame, headersFrame, dataFrame, pingFrame, windowUpdateFrame
-} from "./http2.chuks"
-import { HpackEncoder, HpackDecoder, HpackHeader } from "./hpack.chuks"
-import { GrpcFrameDecoder, frameMessage } from "./framing.chuks"
+import { time } from "std/time"
+import { HpackHeader } from "./hpack.chuks"
+import { GrpcMessage } from "./framing.chuks"
+import { ERR_CANCEL } from "./http2.chuks"
+import { Http2Conn, Http2Stream, Http2StreamEnd, findHeader, parseDecimal } from "./transport.chuks"
 
 // ─── gRPC status codes (grpc-status trailer) ───────────────────────────────
 
@@ -55,6 +51,7 @@ export dataType GrpcRequest {
     method: string;        // full path, e.g. "/echo.Echo/Say"
     data: Buffer;          // raw (already de-framed) request message bytes
     metadata: []HpackHeader;
+    deadlineMs: int;       // absolute deadline (ms since epoch); 0 if no deadline
 }
 
 // A unary response returned by a server handler.
@@ -93,66 +90,186 @@ function emptyBuf(): Buffer {
     return Buffer.fromArray(none)
 }
 
-function noSettings(): []Http2Setting {
-    var s: []Http2Setting = []
-    return s
+// Build a single header.
+function hdr(name: string, value: string): HpackHeader {
+    var h: HpackHeader = { name: name, value: value }
+    return h
 }
 
-// Look up a header value by (lowercase) name; returns "" if absent.
-function headerValue(headers: []HpackHeader, name: string): string {
-    var i: int = 0
-    while (i < headers.length) {
-        if (headers[i].name == name) {
-            return headers[i].value
-        }
-        i = i + 1
+// ─── Deadlines (grpc-timeout) ──────────────────────────────────────────────
+// gRPC carries a per-call timeout in the "grpc-timeout" header as
+// <digits><unit>, unit ∈ {H,M,S,m,u,n}. We encode in whichever unit keeps the
+// value within the 8-digit wire limit, and decode back to milliseconds.
+
+function encodeTimeout(ms: int): string {
+    var v: int = ms
+    if (v < 0) {
+        v = 0
     }
-    return ""
+    if (v <= 99999999) {
+        return string(v) + "m"
+    }
+    var secs: int = v / 1000
+    if (secs <= 99999999) {
+        return string(secs) + "S"
+    }
+    var mins: int = secs / 60
+    if (mins <= 99999999) {
+        return string(mins) + "M"
+    }
+    var hours: int = mins / 60
+    return string(hours) + "H"
 }
 
-// Parse a non-negative decimal integer (e.g. a grpc-status value).
-function parseDecimal(s: string): int {
+// Parse a "grpc-timeout" value to milliseconds (0 if absent/invalid).
+function parseTimeout(s: string): int {
     var b: Buffer = Buffer.fromString(s)
     var n: int = b.length()
-    var val: int = 0
-    var i: int = 0
-    while (i < n) {
-        var c: int = b.getByte(i)
-        if (c >= 48 && c <= 57) {
-            val = val * 10 + (c - 48)
+    if (n < 2) {
+        return 0
+    }
+    var unit: int = b.getByte(n - 1)
+    var val: int = parseDecimal(s)   // parseDecimal ignores the trailing unit letter
+    if (unit == 72) {                // 'H'
+        return val * 3600000
+    }
+    if (unit == 77) {                // 'M'
+        return val * 60000
+    }
+    if (unit == 83) {                // 'S'
+        return val * 1000
+    }
+    if (unit == 109) {               // 'm' (milliseconds)
+        return val
+    }
+    if (unit == 117) {               // 'u' (microseconds)
+        return val / 1000
+    }
+    if (unit == 110) {               // 'n' (nanoseconds)
+        return val / 1000000
+    }
+    return 0
+}
+
+// Resolve an absolute deadline (ms since epoch) from request metadata, or 0.
+function deadlineFromMeta(meta: []HpackHeader): int {
+    var tv: string = findHeader(meta, "grpc-timeout")
+    if (tv.length == 0) {
+        return 0
+    }
+    var ms: int = parseTimeout(tv)
+    if (ms <= 0) {
+        return 0
+    }
+    return time.now() + ms
+}
+
+// Standard gRPC request headers for a client call to `method`.
+function requestHeaders(method: string, authority: string): []HpackHeader {
+    return requestHeadersT(method, authority, 0)
+}
+
+// Request headers with an optional per-call timeout (ms). 0 = no deadline.
+function requestHeadersT(method: string, authority: string, timeoutMs: int): []HpackHeader {
+    var hs: []HpackHeader = [
+        hdr(":method", "POST"),
+        hdr(":scheme", "http"),
+        hdr(":path", method),
+        hdr(":authority", authority),
+        hdr("content-type", "application/grpc"),
+        hdr("te", "trailers")
+    ]
+    if (timeoutMs > 0) {
+        hs.push(hdr("grpc-timeout", encodeTimeout(timeoutMs)))
+    }
+    return hs
+}
+
+// Standard gRPC response headers (initial server HEADERS).
+function responseHeaders(): []HpackHeader {
+    var hs: []HpackHeader = [hdr(":status", "200"), hdr("content-type", "application/grpc")]
+    return hs
+}
+
+// ─── RPC kinds ─────────────────────────────────────────────────────────────
+
+export const RPC_UNARY: int = 0
+export const RPC_SERVER_STREAM: int = 1
+export const RPC_CLIENT_STREAM: int = 2
+export const RPC_BIDI: int = 3
+
+// ─── Server-side stream handle ─────────────────────────────────────────────
+// The context object passed to streaming server handlers. Wraps a transport
+// Http2Stream and lazily emits the response HEADERS on the first send so a
+// handler can fail before producing any output (trailers-only error).
+
+export class GrpcServerStream {
+    var _st: Http2Stream
+    var _method: string
+    var _meta: []HpackHeader
+    var _headersSent: bool
+    var _deadlineMs: int
+
+    constructor(st: Http2Stream, method: string, meta: []HpackHeader) {
+        this._st = st
+        this._method = method
+        this._meta = meta
+        this._headersSent = false
+        this._deadlineMs = deadlineFromMeta(meta)
+    }
+
+    // The full method path, e.g. "/package.Service/Method".
+    public method(): string {
+        return this._method
+    }
+
+    // The request's initial metadata (HTTP/2 request headers).
+    public metadata(): []HpackHeader {
+        return this._meta
+    }
+
+    // Absolute deadline for this RPC (ms since epoch), or 0 if the client set
+    // none. Compare against time.now() to budget work cooperatively.
+    public deadlineMs(): int {
+        return this._deadlineMs
+    }
+
+    // True once the client's deadline (if any) has elapsed.
+    public deadlineExceeded(): bool {
+        if (this._deadlineMs == 0) {
+            return false
         }
-        i = i + 1
+        return time.now() >= this._deadlineMs
     }
-    return val
-}
 
-// Blocking read of one whole HTTP/2 frame from a connection.
-// Throws when the peer closes the connection (readExact hits EOF).
-function readFrameConn(conn: TcpConnection): Http2Frame {
-    var hdr: Buffer = conn.readExact(9)
-    var len: int = (hdr.getByte(0) << 16) | (hdr.getByte(1) << 8) | hdr.getByte(2)
-    var ftype: int = hdr.getByte(3)
-    var flags: int = hdr.getByte(4)
-    var sid: int = ((hdr.getByte(5) & 0x7F) << 24) | (hdr.getByte(6) << 16) | (hdr.getByte(7) << 8) | hdr.getByte(8)
-    var payload: Buffer = emptyBuf()
-    if (len > 0) {
-        payload = conn.readExact(len)
+    // Receive the next request message, or null once the client half-closes.
+    public recv(): Buffer? {
+        var m: GrpcMessage? = this._st.recv()
+        if (m != null) {
+            return m.data
+        }
+        return null
     }
-    var f: Http2Frame = { ftype: ftype, flags: flags, streamId: sid, payload: payload }
-    return f
-}
 
-// ─── Per-stream server state ───────────────────────────────────────────────
+    // Emit the response HEADERS exactly once (before the first message).
+    private _ensureHeaders(): void {
+        if (!this._headersSent) {
+            this._headersSent = true
+            this._st.sendHeaders(responseHeaders(), false)
+        }
+    }
 
-class GrpcStreamState {
-    var path: string
-    var metadata: []HpackHeader
-    var decoder: GrpcFrameDecoder
+    // Send one response message on the stream.
+    public send(data: Buffer): void {
+        this._ensureHeaders()
+        this._st.sendMessage(data)
+    }
 
-    constructor(path: string, metadata: []HpackHeader) {
-        this.path = path
-        this.metadata = metadata
-        this.decoder = new GrpcFrameDecoder()
+    // Finish the RPC with a status and message (sends trailers, ends stream).
+    public finish(status: int, message: string): void {
+        this._ensureHeaders()
+        var trailers: []HpackHeader = [hdr("grpc-status", string(status)), hdr("grpc-message", message)]
+        this._st.sendTrailers(trailers)
     }
 }
 
@@ -161,19 +278,42 @@ class GrpcStreamState {
 export class GrpcServer {
     var _server: TcpServer
     var _handlers: map[string]any
+    var _kinds: map[string]int
 
     // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
     // it back via addr().
     constructor(host: string, port: int) {
         this._server = new TcpServer(host, port)
         this._handlers = {}
+        this._kinds = {}
     }
 
-    // Register a unary handler for a fully-qualified method path, e.g.
-    // "/package.Service/Method". The handler signature is
+    // Register a unary handler:
     //   function(req: GrpcRequest): GrpcResponse
     public register(method: string, handler: any): void {
         this._handlers[method] = handler
+        this._kinds[method] = RPC_UNARY
+    }
+
+    // Register a server-streaming handler (one request, many responses):
+    //   function(req: GrpcRequest, stream: GrpcServerStream): void
+    public registerServerStream(method: string, handler: any): void {
+        this._handlers[method] = handler
+        this._kinds[method] = RPC_SERVER_STREAM
+    }
+
+    // Register a client-streaming handler (many requests, one response):
+    //   function(stream: GrpcServerStream): GrpcResponse
+    public registerClientStream(method: string, handler: any): void {
+        this._handlers[method] = handler
+        this._kinds[method] = RPC_CLIENT_STREAM
+    }
+
+    // Register a bidirectional-streaming handler (many requests, many responses):
+    //   function(stream: GrpcServerStream): void
+    public registerBidiStream(method: string, handler: any): void {
+        this._handlers[method] = handler
+        this._kinds[method] = RPC_BIDI
     }
 
     // The address the server is listening on ("host:port").
@@ -181,159 +321,157 @@ export class GrpcServer {
         return this._server.addr()
     }
 
-    // Accept connections forever, handling each to completion before accepting
-    // the next. Each connection may carry multiple sequential RPCs.
+    // Accept connections forever, serving each on its own task so multiple
+    // connections (and all their multiplexed streams) run concurrently.
     public serve(): void {
         while (true) {
             var conn: TcpConnection = this._server.accept()
-            try {
-                this._handleConnection(conn)
-            } catch (e) {
-                // Connection-level failure (EOF, malformed frame): drop it.
-            }
+            spawn _serveConn(this, conn)
         }
     }
 
-    // Accept and fully handle exactly one connection, then return. Useful for
-    // tests and request/response tooling.
+    // Accept exactly one connection and serve it until the peer disconnects.
+    // Useful for tests and request/response tooling.
     public serveOnce(): void {
         var conn: TcpConnection = this._server.accept()
-        try {
-            this._handleConnection(conn)
-        } catch (e) {
-            // ignore — peer closed
-        }
+        _serveConnSync(this, conn)
     }
 
     public close(): void {
         this._server.close()
     }
+}
 
-    // ── HTTP/2 connection lifecycle ──────────────────────────────────────────
+// Serve every stream on one connection until it closes (blocking).
+function _serveConnSync(srv: GrpcServer, conn: TcpConnection): void {
+    var h2: Http2Conn = new Http2Conn(conn, true)
+    h2.serverHandshake()
+    h2.start()
+    var st: Http2Stream? = h2.acceptStream()
+    while (st != null) {
+        spawn _serveStream(srv, st)
+        st = h2.acceptStream()
+    }
+}
 
-    private _handleConnection(conn: TcpConnection): void {
-        // 1. Consume the 24-byte client connection preface.
-        conn.readExact(24)
-        // 2. Emit our SETTINGS frame as the connection preface.
-        conn.writeAll(settingsFrame(noSettings(), false))
+// Async wrapper so serve() can fan out a connection onto its own task.
+async function _serveConn(srv: GrpcServer, conn: TcpConnection): Task<void> {
+    _serveConnSync(srv, conn)
+}
 
-        var hdec: HpackDecoder = new HpackDecoder(null)
-        var henc: HpackEncoder = new HpackEncoder(null)
-        var streams: map[int]GrpcStreamState = {}
-        var open: bool = true
+// Dispatch a single accepted stream to its registered handler.
+async function _serveStream(srv: GrpcServer, st: Http2Stream): Task<void> {
+    var path: string = findHeader(st.initialMeta, ":path")
+    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta)
 
-        while (open) {
-            var frame: Http2Frame = readFrameConn(conn)
+    if (!srv._handlers.has(path)) {
+        ss.finish(STATUS_UNIMPLEMENTED, "method not found: " + path)
+        return
+    }
 
-            if (frame.ftype == FRAME_SETTINGS) {
-                if ((frame.flags & FLAG_ACK) == 0) {
-                    conn.writeAll(settingsFrame(noSettings(), true))
-                }
-            } else if (frame.ftype == FRAME_HEADERS) {
-                var headers: []HpackHeader = hdec.decode(frame.payload)
-                var path: string = headerValue(headers, ":path")
-                var st: GrpcStreamState = new GrpcStreamState(path, headers)
-                streams[frame.streamId] = st
-                // Client closed the stream with no body — dispatch empty.
-                if ((frame.flags & FLAG_END_STREAM) != 0) {
-                    this._dispatch(conn, henc, frame.streamId, st)
-                    streams.delete(frame.streamId)
-                }
-            } else if (frame.ftype == FRAME_DATA) {
-                if (streams.has(frame.streamId)) {
-                    var ds: GrpcStreamState = streams[frame.streamId]
-                    ds.decoder.push(frame.payload)
-                    // Replenish flow-control windows for what we consumed.
-                    var plen: int = frame.payload.length()
-                    if (plen > 0) {
-                        conn.writeAll(windowUpdateFrame(0, plen))
-                        conn.writeAll(windowUpdateFrame(frame.streamId, plen))
-                    }
-                    if ((frame.flags & FLAG_END_STREAM) != 0) {
-                        this._dispatch(conn, henc, frame.streamId, ds)
-                        streams.delete(frame.streamId)
-                    }
-                }
-            } else if (frame.ftype == FRAME_PING) {
-                if ((frame.flags & FLAG_ACK) == 0) {
-                    conn.writeAll(pingFrame(frame.payload, true))
-                }
-            } else if (frame.ftype == FRAME_RST_STREAM) {
-                if (streams.has(frame.streamId)) {
-                    streams.delete(frame.streamId)
-                }
-            } else if (frame.ftype == FRAME_GOAWAY) {
-                open = false
-            } else if (frame.ftype == FRAME_WINDOW_UPDATE) {
-                // We send small responses that fit the default window; ignore.
+    var kind: int = srv._kinds[path]
+    var handler: any = srv._handlers[path]
+
+    try {
+        if (kind == RPC_UNARY) {
+            var reqData: Buffer = emptyBuf()
+            var m: Buffer? = ss.recv()
+            if (m != null) {
+                reqData = m
             }
+            var req: GrpcRequest = { method: path, data: reqData, metadata: st.initialMeta, deadlineMs: ss.deadlineMs() }
+            var resp: GrpcResponse = handler(req)
+            if (resp.status != STATUS_OK) {
+                ss.finish(resp.status, resp.message)
+            } else {
+                ss.send(resp.data)
+                ss.finish(STATUS_OK, "")
+            }
+        } else if (kind == RPC_SERVER_STREAM) {
+            var reqData2: Buffer = emptyBuf()
+            var m2: Buffer? = ss.recv()
+            if (m2 != null) {
+                reqData2 = m2
+            }
+            var req2: GrpcRequest = { method: path, data: reqData2, metadata: st.initialMeta, deadlineMs: ss.deadlineMs() }
+            handler(req2, ss)
+            ss.finish(STATUS_OK, "")
+        } else if (kind == RPC_CLIENT_STREAM) {
+            var resp3: GrpcResponse = handler(ss)
+            if (resp3.status != STATUS_OK) {
+                ss.finish(resp3.status, resp3.message)
+            } else {
+                ss.send(resp3.data)
+                ss.finish(STATUS_OK, "")
+            }
+        } else {
+            handler(ss)
+            ss.finish(STATUS_OK, "")
         }
+    } catch (e) {
+        ss.finish(STATUS_INTERNAL, string(e))
+    }
+}
 
-        conn.close()
+// ─── Client-side stream handle ─────────────────────────────────────────────
+// Returned by the streaming client openers. Wraps a transport Http2Stream.
+
+export class GrpcClientCall {
+    var _st: Http2Stream
+    var _deadlineMs: int   // absolute deadline (ms since epoch); 0 = none
+
+    constructor(st: Http2Stream) {
+        this._st = st
+        this._deadlineMs = 0
     }
 
-    // ── Dispatch one completed request stream ────────────────────────────────
-
-    private _dispatch(conn: TcpConnection, henc: HpackEncoder, streamId: int, st: GrpcStreamState): void {
-        var reqData: Buffer = emptyBuf()
-        var msg: any = st.decoder.next()
-        if (msg != null) {
-            reqData = msg.data
-        }
-
-        if (!this._handlers.has(st.path)) {
-            this._sendTrailersOnly(conn, henc, streamId, STATUS_UNIMPLEMENTED, "method not found: " + st.path)
-            return
-        }
-
-        var req: GrpcRequest = { method: st.path, data: reqData, metadata: st.metadata }
-        var handler: any = this._handlers[st.path]
-        var resp: GrpcResponse = { data: emptyBuf(), status: STATUS_INTERNAL, message: "" }
-
-        try {
-            resp = handler(req)
-        } catch (e) {
-            this._sendTrailersOnly(conn, henc, streamId, STATUS_INTERNAL, string(e))
-            return
-        }
-
-        if (resp.status != STATUS_OK) {
-            this._sendTrailersOnly(conn, henc, streamId, resp.status, resp.message)
-            return
-        }
-
-        this._sendResponse(conn, henc, streamId, resp)
+    // Attach an absolute deadline (ms since epoch). Called by the client openers
+    // when a per-call timeout was requested.
+    public _setDeadline(absMs: int): void {
+        this._deadlineMs = absMs
     }
 
-    // Full unary response: HEADERS (200) + DATA (message) + trailers.
-    private _sendResponse(conn: TcpConnection, henc: HpackEncoder, streamId: int, resp: GrpcResponse): void {
-        var h1: HpackHeader = { name: ":status", value: "200" }
-        var h2: HpackHeader = { name: "content-type", value: "application/grpc" }
-        var respHdrs: []HpackHeader = [h1, h2]
-        var headBlock: Buffer = henc.encode(respHdrs)
-        conn.writeAll(headersFrame(streamId, headBlock, false, true))
-
-        var framed: Buffer = frameMessage(resp.data)
-        conn.writeAll(dataFrame(streamId, framed, false))
-
-        var t1: HpackHeader = { name: "grpc-status", value: string(resp.status) }
-        var t2: HpackHeader = { name: "grpc-message", value: resp.message }
-        var trailers: []HpackHeader = [t1, t2]
-        var trailerBlock: Buffer = henc.encode(trailers)
-        conn.writeAll(headersFrame(streamId, trailerBlock, true, true))
+    // Send one request message on the stream.
+    public send(data: Buffer): void {
+        this._st.sendMessage(data)
     }
 
-    // Trailers-only response (used for errors / unimplemented): a single
-    // HEADERS frame carrying :status 200 plus grpc-status/grpc-message, with
-    // END_STREAM set.
-    private _sendTrailersOnly(conn: TcpConnection, henc: HpackEncoder, streamId: int, status: int, message: string): void {
-        var h1: HpackHeader = { name: ":status", value: "200" }
-        var h2: HpackHeader = { name: "content-type", value: "application/grpc" }
-        var h3: HpackHeader = { name: "grpc-status", value: string(status) }
-        var h4: HpackHeader = { name: "grpc-message", value: message }
-        var hdrs: []HpackHeader = [h1, h2, h3, h4]
-        var block: Buffer = henc.encode(hdrs)
-        conn.writeAll(headersFrame(streamId, block, true, true))
+    // Close the send side (half-close): no more request messages.
+    public closeSend(): void {
+        this._st.closeSend()
+    }
+
+    // Receive the next response message, or null once the server half-closes.
+    public recv(): Buffer? {
+        var m: GrpcMessage? = this._st.recv()
+        if (m != null) {
+            return m.data
+        }
+        return null
+    }
+
+    // Block for the terminal status/trailers of the call. When a deadline was
+    // set, polls so the call cannot hang past it: on expiry the stream is reset
+    // and a DEADLINE_EXCEEDED reply is returned.
+    public result(): GrpcReply {
+        if (this._deadlineMs == 0) {
+            var end: Http2StreamEnd = this._st.result()
+            var reply: GrpcReply = { data: emptyBuf(), status: end.status, message: end.message }
+            return reply
+        }
+        while (true) {
+            var done: Http2StreamEnd? = this._st.tryResult()
+            if (done != null) {
+                var r2: GrpcReply = { data: emptyBuf(), status: done.status, message: done.message }
+                return r2
+            }
+            if (time.now() >= this._deadlineMs) {
+                this._st.reset(ERR_CANCEL)
+                var dl: GrpcReply = { data: emptyBuf(), status: STATUS_DEADLINE_EXCEEDED, message: "deadline exceeded" }
+                return dl
+            }
+            time.sleep(1)
+        }
     }
 }
 
@@ -341,100 +479,124 @@ export class GrpcServer {
 
 export class GrpcClient {
     var _conn: TcpConnection
-    var _enc: HpackEncoder
-    var _dec: HpackDecoder
-    var _streamId: int
+    var _h2: Http2Conn
     var _authority: string
 
-    // Connect over cleartext HTTP/2 and exchange the connection preface.
+    // Connect over cleartext HTTP/2 (h2c), exchange the preface, and start the
+    // multiplexing reader/mux tasks.
     constructor(host: string, port: int) {
         this._conn = new TcpConnection(host, port)
         this._authority = host + ":" + string(port)
-        // Client preface: the magic string immediately followed by SETTINGS.
-        this._conn.writeAll(Buffer.fromString(CONNECTION_PREFACE))
-        this._conn.writeAll(settingsFrame(noSettings(), false))
-        this._enc = new HpackEncoder(null)
-        this._dec = new HpackDecoder(null)
-        this._streamId = 1
+        this._h2 = new Http2Conn(this._conn, false)
+        this._h2.clientHandshake()
+        this._h2.start()
     }
 
     public close(): void {
+        this._h2.close()
         this._conn.close()
     }
 
-    // Perform a unary RPC: send one request message, await one reply.
+    // Open a raw stream for `method` (request HEADERS sent, body not yet).
+    private _open(method: string): Http2Stream {
+        return this._h2.openStream(requestHeaders(method, this._authority))
+    }
+
+    // Open a raw stream carrying a per-call timeout (ms; 0 = none).
+    private _openT(method: string, timeoutMs: int): Http2Stream {
+        return this._h2.openStream(requestHeadersT(method, this._authority, timeoutMs))
+    }
+
+    // Unary RPC: send one request, await one reply.
     public unary(method: string, message: Buffer): GrpcReply {
-        var sid: int = this._streamId
-        this._streamId = this._streamId + 2
+        return this.unaryWithin(method, message, 0)
+    }
 
-        // Request HEADERS (pseudo-headers first, per HTTP/2).
-        var h1: HpackHeader = { name: ":method", value: "POST" }
-        var h2: HpackHeader = { name: ":scheme", value: "http" }
-        var h3: HpackHeader = { name: ":path", value: method }
-        var h4: HpackHeader = { name: ":authority", value: this._authority }
-        var h5: HpackHeader = { name: "content-type", value: "application/grpc" }
-        var h6: HpackHeader = { name: "te", value: "trailers" }
-        var reqHdrs: []HpackHeader = [h1, h2, h3, h4, h5, h6]
-        var block: Buffer = this._enc.encode(reqHdrs)
-        this._conn.writeAll(headersFrame(sid, block, false, true))
-
-        // Request body: a single length-prefixed message, closing the stream.
-        var framed: Buffer = frameMessage(message)
-        this._conn.writeAll(dataFrame(sid, framed, true))
-
-        // Collect response frames until the server half-closes (END_STREAM).
-        var bodyDec: GrpcFrameDecoder = new GrpcFrameDecoder()
-        var status: int = STATUS_UNKNOWN
-        var statusMsg: string = ""
-        var respData: Buffer = emptyBuf()
-        var done: bool = false
-
-        while (!done) {
-            var frame: Http2Frame = readFrameConn(this._conn)
-
-            if (frame.ftype == FRAME_SETTINGS) {
-                if ((frame.flags & FLAG_ACK) == 0) {
-                    this._conn.writeAll(settingsFrame(noSettings(), true))
-                }
-            } else if (frame.ftype == FRAME_HEADERS) {
-                if (frame.streamId == sid) {
-                    var hl: []HpackHeader = this._dec.decode(frame.payload)
-                    var gs: string = headerValue(hl, "grpc-status")
-                    if (gs != "") {
-                        status = parseDecimal(gs)
-                        statusMsg = headerValue(hl, "grpc-message")
-                    }
-                    if ((frame.flags & FLAG_END_STREAM) != 0) {
-                        done = true
-                    }
-                }
-            } else if (frame.ftype == FRAME_DATA) {
-                if (frame.streamId == sid) {
-                    bodyDec.push(frame.payload)
-                    var m: any = bodyDec.next()
-                    if (m != null) {
-                        respData = m.data
-                    }
-                    // Replenish windows so larger responses keep flowing.
-                    var plen: int = frame.payload.length()
-                    if (plen > 0) {
-                        this._conn.writeAll(windowUpdateFrame(0, plen))
-                        this._conn.writeAll(windowUpdateFrame(sid, plen))
-                    }
-                    if ((frame.flags & FLAG_END_STREAM) != 0) {
-                        done = true
-                    }
-                }
-            } else if (frame.ftype == FRAME_PING) {
-                if ((frame.flags & FLAG_ACK) == 0) {
-                    this._conn.writeAll(pingFrame(frame.payload, true))
-                }
-            } else if (frame.ftype == FRAME_GOAWAY) {
-                done = true
+    // Unary RPC with a per-call timeout (ms; 0 = no deadline). On expiry the
+    // stream is reset and a DEADLINE_EXCEEDED reply is returned.
+    public unaryWithin(method: string, message: Buffer, timeoutMs: int): GrpcReply {
+        var st: Http2Stream = this._openT(method, timeoutMs)
+        st.sendMessage(message)
+        st.closeSend()
+        if (timeoutMs <= 0) {
+            var respData: Buffer = emptyBuf()
+            var m: GrpcMessage? = st.recv()
+            if (m != null) {
+                respData = m.data
             }
+            // Drain any trailing messages so the stream reaches its terminal state.
+            var extra: GrpcMessage? = st.recv()
+            while (extra != null) {
+                extra = st.recv()
+            }
+            var end: Http2StreamEnd = st.result()
+            var reply: GrpcReply = { data: respData, status: end.status, message: end.message }
+            return reply
         }
+        var deadline: int = time.now() + timeoutMs
+        var got: Buffer = emptyBuf()
+        while (true) {
+            var dm: GrpcMessage? = st.tryRecv()
+            if (dm != null) {
+                got = dm.data
+            }
+            var de: Http2StreamEnd? = st.tryResult()
+            if (de != null) {
+                var r2: GrpcReply = { data: got, status: de.status, message: de.message }
+                return r2
+            }
+            if (time.now() >= deadline) {
+                st.reset(ERR_CANCEL)
+                var dl: GrpcReply = { data: emptyBuf(), status: STATUS_DEADLINE_EXCEEDED, message: "deadline exceeded" }
+                return dl
+            }
+            time.sleep(1)
+        }
+    }
 
-        var reply: GrpcReply = { data: respData, status: status, message: statusMsg }
-        return reply
+    // Server-streaming RPC: send one request, then read many responses via the
+    // returned call (recv() until null, then result()).
+    public serverStream(method: string, message: Buffer): GrpcClientCall {
+        return this.serverStreamWithin(method, message, 0)
+    }
+
+    public serverStreamWithin(method: string, message: Buffer, timeoutMs: int): GrpcClientCall {
+        var st: Http2Stream = this._openT(method, timeoutMs)
+        st.sendMessage(message)
+        st.closeSend()
+        var call: GrpcClientCall = new GrpcClientCall(st)
+        if (timeoutMs > 0) {
+            call._setDeadline(time.now() + timeoutMs)
+        }
+        return call
+    }
+
+    // Client-streaming RPC: send many requests via the returned call (send()…
+        // closeSend()), then read one response (recv()) and result().
+    public clientStream(method: string): GrpcClientCall {
+        return this.clientStreamWithin(method, 0)
+    }
+
+    public clientStreamWithin(method: string, timeoutMs: int): GrpcClientCall {
+        var st: Http2Stream = this._openT(method, timeoutMs)
+        var call: GrpcClientCall = new GrpcClientCall(st)
+        if (timeoutMs > 0) {
+            call._setDeadline(time.now() + timeoutMs)
+        }
+        return call
+    }
+
+    // Bidirectional-streaming RPC: interleave send()/recv() on the returned call.
+    public bidiStream(method: string): GrpcClientCall {
+        return this.bidiStreamWithin(method, 0)
+    }
+
+    public bidiStreamWithin(method: string, timeoutMs: int): GrpcClientCall {
+        var st: Http2Stream = this._openT(method, timeoutMs)
+        var call: GrpcClientCall = new GrpcClientCall(st)
+        if (timeoutMs > 0) {
+            call._setDeadline(time.now() + timeoutMs)
+        }
+        return call
     }
 }

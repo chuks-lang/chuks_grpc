@@ -4,11 +4,12 @@
 
 import { test } from "std/test"
 import { Buffer } from "std/buffer"
+import { time } from "std/time"
 import {
     GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
     GrpcServerStream, GrpcClientCall,
     grpcOk,
-    STATUS_OK, STATUS_UNIMPLEMENTED
+    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED
 } from "../src/index.chuks"
 import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
 
@@ -91,6 +92,20 @@ function chatHandler(stream: GrpcServerStream): void {
         stream.send(encodeName("echo:" + decodeName(m)))
         m = stream.recv()
     }
+}
+
+// Slow unary handler: sleeps past a short client deadline before replying.
+function slowHandler(req: GrpcRequest): GrpcResponse {
+    time.sleep(300)
+    return grpcOk(encodeName("late"))
+}
+
+// Reports whether the server observed a client deadline on the request.
+function deadlineEchoHandler(req: GrpcRequest): GrpcResponse {
+    if (req.deadlineMs > 0) {
+        return grpcOk(encodeName("has-deadline"))
+    }
+    return grpcOk(encodeName("no-deadline"))
 }
 
 // Run a single connection's worth of serving on a background task.
@@ -220,6 +235,53 @@ try {
     await t6
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 6 bidi-stream — " + string(e)) }
+
+// 7 — client deadline fires: slow server, short timeout -> DEADLINE_EXCEEDED
+try {
+    var srv7: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv7.register("/echo.Echo/Slow", slowHandler)
+    var port7: int = portOf(srv7.addr())
+    var t7: Task<void> = spawn runServer(srv7)
+
+    var client7: GrpcClient = new GrpcClient("127.0.0.1", port7)
+    var rep7: GrpcReply = client7.unaryWithin("/echo.Echo/Slow", encodeName("x"), 50)
+    test.assertEqual(rep7.status, STATUS_DEADLINE_EXCEEDED)
+    client7.close()
+    await t7
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 7 deadline fires — " + string(e)) }
+
+// 8 — under deadline: fast server, generous timeout -> OK
+try {
+    var srv8: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv8.register("/echo.Echo/Say", sayHandler)
+    var port8: int = portOf(srv8.addr())
+    var t8: Task<void> = spawn runServer(srv8)
+
+    var client8: GrpcClient = new GrpcClient("127.0.0.1", port8)
+    var rep8: GrpcReply = client8.unaryWithin("/echo.Echo/Say", encodeName("ada"), 5000)
+    test.assertEqual(rep8.status, STATUS_OK)
+    test.assertEqual(decodeName(rep8.data), "hello, ada")
+    client8.close()
+    await t8
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 8 under deadline — " + string(e)) }
+
+// 9 — server observes the propagated grpc-timeout header
+try {
+    var srv9: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv9.register("/echo.Echo/Deadline", deadlineEchoHandler)
+    var port9: int = portOf(srv9.addr())
+    var t9: Task<void> = spawn runServer(srv9)
+
+    var client9: GrpcClient = new GrpcClient("127.0.0.1", port9)
+    var rep9: GrpcReply = client9.unaryWithin("/echo.Echo/Deadline", encodeName("x"), 5000)
+    test.assertEqual(rep9.status, STATUS_OK)
+    test.assertEqual(decodeName(rep9.data), "has-deadline")
+    client9.close()
+    await t9
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 9 server deadline header — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

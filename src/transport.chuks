@@ -1,0 +1,801 @@
+// ─── chuks_grpc · HTTP/2 connection driver (transport core) ─────────────────
+// A multiplexed, flow-controlled HTTP/2 connection that both the gRPC server
+// and client are built on. It supports many concurrent streams, CONTINUATION
+// header assembly, connection- and stream-level flow control, and clean
+// shutdown.
+//
+// Concurrency model (no `select`, no mutex — each piece of mutable state is
+    // owned by exactly one task; everything else flows through channels):
+//
+//   • MUX task   — the sole owner of socket WRITES, the HPACK *encoder*, and
+//                  all flow-control send accounting. Driven by one
+//                  Channel<MuxEvent>. Every outbound frame is produced here.
+//   • READER task — the sole owner of socket READS, the HPACK *decoder*, and
+//                  the stream table. Translates inbound frames into per-stream
+//                  messages and mux events.
+//   • Handler tasks — never touch the socket directly; they call
+//                  stream.recv()/sendMessage()/… which enqueue mux events.
+//
+// This keeps the design data-race free even though `spawn` gives real
+// parallelism (goroutines).
+// ───────────────────────────────────────────────────────────────────────────
+
+import { TcpConnection } from "std/net"
+import { Buffer } from "std/buffer"
+import { Channel } from "std/channel"
+import {
+    CONNECTION_PREFACE,
+    FRAME_DATA, FRAME_HEADERS, FRAME_RST_STREAM, FRAME_SETTINGS,
+    FRAME_PING, FRAME_GOAWAY, FRAME_WINDOW_UPDATE, FRAME_CONTINUATION,
+    FLAG_END_STREAM, FLAG_END_HEADERS, FLAG_ACK, FLAG_PADDED, FLAG_PRIORITY,
+    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_FRAME_SIZE,
+    ERR_NO_ERROR, ERR_CANCEL, ERR_PROTOCOL_ERROR,
+    DEFAULT_MAX_FRAME_SIZE,
+    Http2Frame, Http2Setting,
+    encodeFrame, settingsFrame, dataFrame, headersFrame, windowUpdateFrame,
+    rstStreamFrame, goawayFrame, pingFrame, parseSettings, parseWindowUpdate
+} from "./http2.chuks"
+import { HpackEncoder, HpackDecoder, HpackHeader } from "./hpack.chuks"
+import { GrpcFrameDecoder, GrpcMessage, frameMessage } from "./framing.chuks"
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+// HTTP/2 default per-stream / connection flow-control window (RFC 7540 §6.9.2).
+export const H2_DEFAULT_WINDOW: int = 65535
+
+// The receive window we advertise per stream (1 MiB). Larger windows let peers
+// stream sizeable messages without round-tripping for credit on every frame.
+export const H2_RECV_WINDOW: int = 1048576
+
+// Mux event kinds.
+const MX_HEADERS: int = 0    // encode `headers` and write a HEADERS block
+const MX_DATA: int = 1       // flow-controlled DATA send of `payload`
+const MX_WRITE: int = 2      // write `raw` bytes verbatim (control frames)
+const MX_WUP: int = 3        // peer WINDOW_UPDATE: add `inc` credit to `streamId`
+const MX_SETTINGS: int = 4   // peer SETTINGS: apply initWindow / maxFrame
+const MX_CLOSE: int = 5      // stop the mux loop
+
+// ─── Events & records ─────────────────────────────────────────────────────
+
+// A unit of work for the mux task. Only the fields relevant to `kind` are read.
+dataType MuxEvent {
+    kind: int;
+    raw: Buffer;
+    headers: []HpackHeader;
+    streamId: int;
+    payload: Buffer;
+    endStream: bool;
+    inc: int;
+    initWindow: int;
+    maxFrame: int;
+}
+
+// Terminal information for a stream (status + trailers), delivered once.
+export dataType Http2StreamEnd {
+    status: int;
+    message: string;
+    trailers: []HpackHeader;
+    reset: bool;        // true if the stream ended via RST_STREAM
+}
+
+function emptyBuf(): Buffer {
+    var none: []any = []
+    return Buffer.fromArray(none)
+}
+
+function noHeaders(): []HpackHeader {
+    var h: []HpackHeader = []
+    return h
+}
+
+// Look up a header value by (lowercase) name; "" if absent.
+export function findHeader(headers: []HpackHeader, name: string): string {
+    var i: int = 0
+    while (i < headers.length) {
+        if (headers[i].name == name) {
+            return headers[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Parse a non-negative decimal integer (e.g. a grpc-status value).
+export function parseDecimal(s: string): int {
+    var b: Buffer = Buffer.fromString(s)
+    var n: int = b.length()
+    var val: int = 0
+    var i: int = 0
+    while (i < n) {
+        var c: int = b.getByte(i)
+        if (c >= 48 && c <= 57) {
+            val = val * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return val
+}
+
+// ─── Mux-side per-stream send state ─────────────────────────────────────────
+// A class (not a dataType) because the mux mutates `offset` / `window` in place.
+
+class MuxPending {
+    var streamId: int
+    var payload: Buffer
+    var offset: int
+    var endStream: bool
+    var finSent: bool
+
+    constructor(streamId: int, payload: Buffer, endStream: bool) {
+        this.streamId = streamId
+        this.payload = payload
+        this.offset = 0
+        this.endStream = endStream
+        this.finSent = false
+    }
+}
+
+// ─── Stream ─────────────────────────────────────────────────────────────────
+// The application-facing handle for one RPC. Inbound messages arrive on
+// `_inbound`; the terminal status/trailers arrive once on `_done`.
+
+export class Http2Stream {
+    var id: int
+    var initialMeta: []HpackHeader
+    var _inbound: Channel<GrpcMessage>
+    var _done: Channel<Http2StreamEnd>
+    var _events: Channel<MuxEvent>
+    var _sendClosed: bool
+    var _inClosed: bool
+    var _doneSent: bool
+
+    constructor(id: int, events: Channel<MuxEvent>) {
+        this.id = id
+        this.initialMeta = noHeaders()
+        this._inbound = new Channel<GrpcMessage>(64)
+        this._done = new Channel<Http2StreamEnd>(1)
+        this._events = events
+        this._sendClosed = false
+        this._inClosed = false
+        this._doneSent = false
+    }
+
+    // Idempotently close the inbound side (peer half-closed / reset / teardown).
+    public _closeInbound(): void {
+        if (!this._inClosed) {
+            this._inClosed = true
+            this._inbound.close()
+        }
+    }
+
+    // Idempotently deliver the terminal status/trailers (client side).
+    public _finish(end: Http2StreamEnd): void {
+        if (!this._doneSent) {
+            this._doneSent = true
+            this._done.send(end)
+        }
+    }
+
+    // Receive the next inbound message, or null when the peer half-closed.
+    // Consuming a message replenishes the flow-control window (backpressure).
+    public recv(): GrpcMessage? {
+        var m: GrpcMessage? = this._inbound.receive()
+        if (m != null) {
+            var consumed: int = m.data.length() + 5
+            var parts: []Buffer = [windowUpdateFrame(0, consumed), windowUpdateFrame(this.id, consumed)]
+            var ev: MuxEvent = mkWrite(Buffer.concat(parts))
+            this._events.send(ev)
+        }
+        return m
+    }
+
+    // Non-blocking poll for the next inbound message. Returns null when nothing
+    // is immediately available (which is ambiguous with end-of-stream — callers
+    // racing a deadline should also poll tryResult() for the terminal end).
+    public tryRecv(): GrpcMessage? {
+        var res: any = this._inbound.tryReceive()
+        var ok: bool = res["ok"]
+        var none: GrpcMessage? = null
+        if (!ok) {
+            return none
+        }
+        var val: any = res["value"]
+        if (val == null) {
+            return none
+        }
+        var m: GrpcMessage = val
+        var consumed: int = m.data.length() + 5
+        var parts: []Buffer = [windowUpdateFrame(0, consumed), windowUpdateFrame(this.id, consumed)]
+        var ev: MuxEvent = mkWrite(Buffer.concat(parts))
+        this._events.send(ev)
+        return m
+    }
+
+    // Non-blocking poll for the terminal status/trailers. Returns null until the
+    // stream has finished. `_done` is never closed, so this is unambiguous.
+    public tryResult(): Http2StreamEnd? {
+        var res: any = this._done.tryReceive()
+        var ok: bool = res["ok"]
+        var none: Http2StreamEnd? = null
+        if (!ok) {
+            return none
+        }
+        var val: any = res["value"]
+        if (val == null) {
+            return none
+        }
+        var end: Http2StreamEnd = val
+        return end
+    }
+
+    // Send one gRPC message on this stream (length-prefixed + flow-controlled).
+    public sendMessage(data: Buffer): void {
+        var framed: Buffer = frameMessage(data)
+        var ev: MuxEvent = mkData(this.id, framed, false)
+        this._events.send(ev)
+    }
+
+    // Send a HEADERS block built from a header list (encoded by the mux).
+    public sendHeaders(headers: []HpackHeader, endStream: bool): void {
+        var ev: MuxEvent = mkHeaders(this.id, headers, endStream)
+        this._events.send(ev)
+    }
+
+    // Close the send side with a final empty DATA frame carrying END_STREAM.
+    public closeSend(): void {
+        if (this._sendClosed) {
+            return
+        }
+        this._sendClosed = true
+        var ev: MuxEvent = mkData(this.id, emptyBuf(), true)
+        this._events.send(ev)
+    }
+
+    // Send trailers (a HEADERS block with END_STREAM) — used by servers.
+    public sendTrailers(trailers: []HpackHeader): void {
+        if (this._sendClosed) {
+            return
+        }
+        this._sendClosed = true
+        var ev: MuxEvent = mkHeaders(this.id, trailers, true)
+        this._events.send(ev)
+    }
+
+    // Abort the stream with RST_STREAM(code).
+    public reset(code: int): void {
+        if (this._sendClosed) {
+            return
+        }
+        this._sendClosed = true
+        var ev: MuxEvent = mkWrite(rstStreamFrame(this.id, code))
+        this._events.send(ev)
+    }
+
+    // Block for the terminal status/trailers of the stream.
+    public result(): Http2StreamEnd {
+        var e: Http2StreamEnd? = this._done.receive()
+        if (e != null) {
+            return e
+        }
+        var fallback: Http2StreamEnd = { status: 2, message: "stream closed", trailers: noHeaders(), reset: true }
+        return fallback
+    }
+}
+
+// ─── MuxEvent constructors ──────────────────────────────────────────────────
+
+function mkHeaders(streamId: int, headers: []HpackHeader, endStream: bool): MuxEvent {
+    var e: MuxEvent = { kind: MX_HEADERS, raw: emptyBuf(), headers: headers, streamId: streamId, payload: emptyBuf(), endStream: endStream, inc: 0, initWindow: 0, maxFrame: 0 }
+    return e
+}
+
+function mkData(streamId: int, payload: Buffer, endStream: bool): MuxEvent {
+    var e: MuxEvent = { kind: MX_DATA, raw: emptyBuf(), headers: noHeaders(), streamId: streamId, payload: payload, endStream: endStream, inc: 0, initWindow: 0, maxFrame: 0 }
+    return e
+}
+
+function mkWrite(raw: Buffer): MuxEvent {
+    var e: MuxEvent = { kind: MX_WRITE, raw: raw, headers: noHeaders(), streamId: 0, payload: emptyBuf(), endStream: false, inc: 0, initWindow: 0, maxFrame: 0 }
+    return e
+}
+
+function mkWup(streamId: int, inc: int): MuxEvent {
+    var e: MuxEvent = { kind: MX_WUP, raw: emptyBuf(), headers: noHeaders(), streamId: streamId, payload: emptyBuf(), endStream: false, inc: inc, initWindow: 0, maxFrame: 0 }
+    return e
+}
+
+function mkSettings(initWindow: int, maxFrame: int): MuxEvent {
+    var e: MuxEvent = { kind: MX_SETTINGS, raw: emptyBuf(), headers: noHeaders(), streamId: 0, payload: emptyBuf(), endStream: false, inc: 0, initWindow: initWindow, maxFrame: maxFrame }
+    return e
+}
+
+function mkClose(): MuxEvent {
+    var e: MuxEvent = { kind: MX_CLOSE, raw: emptyBuf(), headers: noHeaders(), streamId: 0, payload: emptyBuf(), endStream: false, inc: 0, initWindow: 0, maxFrame: 0 }
+    return e
+}
+
+// ─── Http2Conn ───────────────────────────────────────────────────────────────
+
+export class Http2Conn {
+    var _conn: TcpConnection
+    var _isServer: bool
+    var _events: Channel<MuxEvent>
+    var _accept: Channel<Http2Stream>
+    var _streams: map[int]Http2Stream
+    var _nextId: int
+    var _closed: bool
+
+    constructor(conn: TcpConnection, isServer: bool) {
+        this._conn = conn
+        this._isServer = isServer
+        this._events = new Channel<MuxEvent>(256)
+        this._accept = new Channel<Http2Stream>(128)
+        var streams0: map[int]Http2Stream = {}
+        this._streams = streams0
+        // Clients use odd stream ids starting at 1; servers never originate.
+        this._nextId = 1
+        this._closed = false
+    }
+
+    public events(): Channel<MuxEvent> {
+        return this._events
+    }
+
+    // ── Handshakes ────────────────────────────────────────────────────────────
+
+    public serverHandshake(): void {
+        // Consume the 24-byte client connection preface, then send our SETTINGS.
+        this._conn.readExact(24)
+        var s1: Http2Setting = { id: SETTINGS_INITIAL_WINDOW_SIZE, value: H2_RECV_WINDOW }
+        var settings: []Http2Setting = [s1]
+        this._conn.writeAll(settingsFrame(settings, false))
+        // Grow the connection-level receive window beyond the 64 KiB default.
+        this._conn.writeAll(windowUpdateFrame(0, H2_RECV_WINDOW - H2_DEFAULT_WINDOW))
+    }
+
+    public clientHandshake(): void {
+        this._conn.writeAll(Buffer.fromString(CONNECTION_PREFACE))
+        var s1: Http2Setting = { id: SETTINGS_INITIAL_WINDOW_SIZE, value: H2_RECV_WINDOW }
+        var settings: []Http2Setting = [s1]
+        this._conn.writeAll(settingsFrame(settings, false))
+        this._conn.writeAll(windowUpdateFrame(0, H2_RECV_WINDOW - H2_DEFAULT_WINDOW))
+    }
+
+    // ── Stream creation (client) ──────────────────────────────────────────────
+
+    // Open a new client stream, sending its request HEADERS. The body is sent
+    // separately via stream.sendMessage()/closeSend().
+    public openStream(headers: []HpackHeader): Http2Stream {
+        var sid: int = this._nextId
+        this._nextId = this._nextId + 2
+        var st: Http2Stream = new Http2Stream(sid, this._events)
+        this._streams[sid] = st
+        this._events.send(mkHeaders(sid, headers, false))
+        return st
+    }
+
+    // ── Accept (server) ───────────────────────────────────────────────────────
+
+    // Block for the next inbound request stream, or null once the connection
+    // has closed.
+    public acceptStream(): Http2Stream? {
+        return this._accept.receive()
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    // Spawn the mux and reader tasks. Call after the handshake.
+    public start(): void {
+        spawn _muxLoop(this)
+        spawn _readLoop(this)
+    }
+
+    public close(): void {
+        if (this._closed) {
+            return
+        }
+        this._closed = true
+        this._events.send(mkClose())
+    }
+}
+
+// ─── Mux task ────────────────────────────────────────────────────────────────
+// Sole owner of socket writes, the HPACK encoder, and send-side flow control.
+
+class MuxState {
+    var connWindow: int          // our remaining credit to send (peer recv window)
+    var peerInitWindow: int      // peer's per-stream initial window
+    var peerMaxFrame: int        // peer's max DATA frame size
+    var streamWindow: map[int]int
+    var pending: []MuxPending
+
+    constructor() {
+        this.connWindow = H2_DEFAULT_WINDOW
+        this.peerInitWindow = H2_DEFAULT_WINDOW
+        this.peerMaxFrame = DEFAULT_MAX_FRAME_SIZE
+        var sw0: map[int]int = {}
+        this.streamWindow = sw0
+        this.pending = []
+    }
+}
+
+// Copy `len` bytes of `buf` starting at `offset` into a fresh Buffer.
+function sliceBuf(buf: Buffer, offset: int, len: int): Buffer {
+    var out: []any = []
+    var i: int = 0
+    while (i < len) {
+        out.push(buf.getByte(offset + i))
+        i = i + 1
+    }
+    return Buffer.fromArray(out)
+}
+
+// Send as much of one pending message as the connection/stream windows allow.
+function sendPending(conn: TcpConnection, st: MuxState, p: MuxPending): void {
+    var total: int = p.payload.length()
+    if (total == 0) {
+        if (p.endStream && !p.finSent) {
+            conn.writeAll(dataFrame(p.streamId, emptyBuf(), true))
+            p.finSent = true
+        }
+        return
+    }
+    while (p.offset < total) {
+        var swin: int = st.peerInitWindow
+        if (st.streamWindow.has(p.streamId)) {
+            swin = st.streamWindow[p.streamId]
+        }
+        if (st.connWindow <= 0 || swin <= 0) {
+            return
+        }
+        var chunk: int = total - p.offset
+        if (chunk > st.peerMaxFrame) {
+            chunk = st.peerMaxFrame
+        }
+        if (chunk > st.connWindow) {
+            chunk = st.connWindow
+        }
+        if (chunk > swin) {
+            chunk = swin
+        }
+        var slice: Buffer = sliceBuf(p.payload, p.offset, chunk)
+        p.offset = p.offset + chunk
+        var last: bool = (p.offset >= total) && p.endStream
+        conn.writeAll(dataFrame(p.streamId, slice, last))
+        if (last) {
+            p.finSent = true
+        }
+        st.connWindow = st.connWindow - chunk
+        st.streamWindow[p.streamId] = swin - chunk
+    }
+}
+
+// Flush all pending messages, retaining those still blocked on flow control.
+function flushPending(conn: TcpConnection, st: MuxState): void {
+    var remaining: []MuxPending = []
+    var i: int = 0
+    while (i < st.pending.length) {
+        var p: MuxPending = st.pending[i]
+        sendPending(conn, st, p)
+        var total: int = p.payload.length()
+        var done: bool = (p.offset >= total) && (p.finSent || !p.endStream)
+        if (!done) {
+            remaining.push(p)
+        }
+        i = i + 1
+    }
+    st.pending = remaining
+}
+
+// Write a HPACK header block, splitting into CONTINUATION frames if oversized.
+function writeHeaderBlock(conn: TcpConnection, streamId: int, block: Buffer, endStream: bool, maxFrame: int): void {
+    var total: int = block.length()
+    if (total <= maxFrame) {
+        conn.writeAll(headersFrame(streamId, block, endStream, true))
+        return
+    }
+    var first: Buffer = sliceBuf(block, 0, maxFrame)
+    conn.writeAll(headersFrame(streamId, first, endStream, false))
+    var off: int = maxFrame
+    while (off < total) {
+        var n: int = total - off
+        if (n > maxFrame) {
+            n = maxFrame
+        }
+        var chunk: Buffer = sliceBuf(block, off, n)
+        var flags: int = 0
+        if (off + n >= total) {
+            flags = FLAG_END_HEADERS
+        }
+        conn.writeAll(encodeFrame(FRAME_CONTINUATION, flags, streamId, chunk))
+        off = off + n
+    }
+}
+
+async function _muxLoop(h: Http2Conn): Task<void> {
+    var conn: TcpConnection = h._conn
+    var henc: HpackEncoder = new HpackEncoder(null)
+    var st: MuxState = new MuxState()
+    var running: bool = true
+
+    while (running) {
+        var evOpt: MuxEvent? = h._events.receive()
+        if (evOpt == null) {
+            break
+        }
+        var e: MuxEvent = evOpt
+
+        if (e.kind == MX_WRITE) {
+            conn.writeAll(e.raw)
+        } else if (e.kind == MX_HEADERS) {
+            var block: Buffer = henc.encode(e.headers)
+            writeHeaderBlock(conn, e.streamId, block, e.endStream, st.peerMaxFrame)
+        } else if (e.kind == MX_DATA) {
+            if (!st.streamWindow.has(e.streamId)) {
+                st.streamWindow[e.streamId] = st.peerInitWindow
+            }
+            st.pending.push(new MuxPending(e.streamId, e.payload, e.endStream))
+            flushPending(conn, st)
+        } else if (e.kind == MX_WUP) {
+            if (e.streamId == 0) {
+                st.connWindow = st.connWindow + e.inc
+            } else {
+                var cur: int = st.peerInitWindow
+                if (st.streamWindow.has(e.streamId)) {
+                    cur = st.streamWindow[e.streamId]
+                }
+                st.streamWindow[e.streamId] = cur + e.inc
+            }
+            flushPending(conn, st)
+        } else if (e.kind == MX_SETTINGS) {
+            if (e.initWindow >= 0) {
+                var delta: int = e.initWindow - st.peerInitWindow
+                st.peerInitWindow = e.initWindow
+                var swKeys: []int = st.streamWindow.keys()
+                var k: int = 0
+                while (k < swKeys.length) {
+                    var sid: int = swKeys[k]
+                    st.streamWindow[sid] = st.streamWindow[sid] + delta
+                    k = k + 1
+                }
+            }
+            if (e.maxFrame >= 0) {
+                st.peerMaxFrame = e.maxFrame
+            }
+            flushPending(conn, st)
+        } else if (e.kind == MX_CLOSE) {
+            running = false
+        }
+    }
+}
+
+// ─── Reader task ─────────────────────────────────────────────────────────────
+// Sole owner of socket reads, the HPACK decoder, and the stream table.
+
+function noSettingsArr(): []Http2Setting {
+    var s: []Http2Setting = []
+    return s
+}
+
+// Blocking read of one whole HTTP/2 frame. Throws on EOF.
+function readFrame(conn: TcpConnection): Http2Frame {
+    var hdr: Buffer = conn.readExact(9)
+    var len: int = (hdr.getByte(0) << 16) | (hdr.getByte(1) << 8) | hdr.getByte(2)
+    var ftype: int = hdr.getByte(3)
+    var flags: int = hdr.getByte(4)
+    var sid: int = ((hdr.getByte(5) & 0x7F) << 24) | (hdr.getByte(6) << 16) | (hdr.getByte(7) << 8) | hdr.getByte(8)
+    var payload: Buffer = emptyBuf()
+    if (len > 0) {
+        payload = conn.readExact(len)
+    }
+    var f: Http2Frame = { ftype: ftype, flags: flags, streamId: sid, payload: payload }
+    return f
+}
+
+// Strip PADDED / PRIORITY framing from a HEADERS payload, returning the raw
+// HPACK block bytes.
+function stripHeaderPadding(frame: Http2Frame): Buffer {
+    var payload: Buffer = frame.payload
+    var n: int = payload.length()
+    var start: int = 0
+    var padLen: int = 0
+    if ((frame.flags & FLAG_PADDED) != 0) {
+        padLen = payload.getByte(0)
+        start = 1
+    }
+    if ((frame.flags & FLAG_PRIORITY) != 0) {
+        start = start + 5
+    }
+    var end: int = n - padLen
+    if (end < start) {
+        end = start
+    }
+    return sliceBuf(payload, start, end - start)
+}
+
+// Strip PADDED framing from a DATA payload.
+function stripDataPadding(frame: Http2Frame): Buffer {
+    if ((frame.flags & FLAG_PADDED) == 0) {
+        return frame.payload
+    }
+    var payload: Buffer = frame.payload
+    var n: int = payload.length()
+    var padLen: int = payload.getByte(0)
+    var end: int = n - padLen
+    if (end < 1) {
+        end = 1
+    }
+    return sliceBuf(payload, 1, end - 1)
+}
+
+// Read and assemble a full header block (HEADERS + any CONTINUATION frames).
+function readHeaderBlock(conn: TcpConnection, frame: Http2Frame): Buffer {
+    var block: Buffer = stripHeaderPadding(frame)
+    if ((frame.flags & FLAG_END_HEADERS) != 0) {
+        return block
+    }
+    var acc: []Buffer = [block]
+    var more: bool = true
+    while (more) {
+        var cf: Http2Frame = readFrame(conn)
+        acc.push(cf.payload)
+        if ((cf.flags & FLAG_END_HEADERS) != 0) {
+            more = false
+        }
+    }
+    return Buffer.concat(acc)
+}
+
+async function _readLoop(h: Http2Conn): Task<void> {
+    var conn: TcpConnection = h._conn
+    var hdec: HpackDecoder = new HpackDecoder(null)
+    var decoders: map[int]GrpcFrameDecoder = {}
+    var running: bool = true
+
+    try {
+        while (running) {
+            var frame: Http2Frame = readFrame(conn)
+
+            if (frame.ftype == FRAME_SETTINGS) {
+                if ((frame.flags & FLAG_ACK) == 0) {
+                    var sets: []Http2Setting = parseSettings(frame.payload)
+                    var initW: int = -1
+                    var maxF: int = -1
+                    var i: int = 0
+                    while (i < sets.length) {
+                        if (sets[i].id == SETTINGS_INITIAL_WINDOW_SIZE) {
+                            initW = sets[i].value
+                        }
+                        if (sets[i].id == SETTINGS_MAX_FRAME_SIZE) {
+                            maxF = sets[i].value
+                        }
+                        i = i + 1
+                    }
+                    if (initW >= 0 || maxF >= 0) {
+                        h._events.send(mkSettings(initW, maxF))
+                    }
+                    h._events.send(mkWrite(settingsFrame(noSettingsArr(), true)))
+                }
+            } else if (frame.ftype == FRAME_HEADERS) {
+                var block: Buffer = readHeaderBlock(conn, frame)
+                var headers: []HpackHeader = hdec.decode(block)
+                _routeHeaders(h, frame, headers, decoders)
+            } else if (frame.ftype == FRAME_DATA) {
+                _routeData(h, frame, decoders)
+            } else if (frame.ftype == FRAME_PING) {
+                if ((frame.flags & FLAG_ACK) == 0) {
+                    h._events.send(mkWrite(pingFrame(frame.payload, true)))
+                }
+            } else if (frame.ftype == FRAME_RST_STREAM) {
+                _routeReset(h, frame, decoders)
+            } else if (frame.ftype == FRAME_WINDOW_UPDATE) {
+                var inc: int = parseWindowUpdate(frame.payload)
+                h._events.send(mkWup(frame.streamId, inc))
+            } else if (frame.ftype == FRAME_GOAWAY) {
+                running = false
+            }
+        }
+    } catch (err) {
+        // EOF or malformed frame: fall through to teardown.
+    }
+
+    _teardown(h)
+}
+
+// Route an inbound HEADERS block to the right stream.
+function _routeHeaders(h: Http2Conn, frame: Http2Frame, headers: []HpackHeader, decoders: map[int]GrpcFrameDecoder): void {
+    var endStream: bool = (frame.flags & FLAG_END_STREAM) != 0
+    if (h._isServer) {
+        if (!h._streams.has(frame.streamId)) {
+            var st: Http2Stream = new Http2Stream(frame.streamId, h._events)
+            st.initialMeta = headers
+            h._streams[frame.streamId] = st
+            decoders[frame.streamId] = new GrpcFrameDecoder()
+            h._accept.send(st)
+            if (endStream) {
+                st._closeInbound()
+            }
+        } else {
+            // Trailing client headers (client-stream end).
+            if (endStream) {
+                h._streams[frame.streamId]._closeInbound()
+            }
+        }
+        return
+    }
+    // Client side: response headers or trailers.
+    if (!h._streams.has(frame.streamId)) {
+        return
+    }
+    var cst: Http2Stream = h._streams[frame.streamId]
+    var gs: string = findHeader(headers, "grpc-status")
+    if (gs != "") {
+        var end: Http2StreamEnd = { status: parseDecimal(gs), message: findHeader(headers, "grpc-message"), trailers: headers, reset: false }
+        cst._closeInbound()
+        cst._finish(end)
+        h._streams.delete(frame.streamId)
+        decoders.delete(frame.streamId)
+    } else {
+        cst.initialMeta = headers
+        if (endStream) {
+            cst._closeInbound()
+        }
+    }
+}
+
+// Route inbound DATA to the right stream's message decoder.
+function _routeData(h: Http2Conn, frame: Http2Frame, decoders: map[int]GrpcFrameDecoder): void {
+    if (!h._streams.has(frame.streamId)) {
+        return
+    }
+    var st: Http2Stream = h._streams[frame.streamId]
+    if (!decoders.has(frame.streamId)) {
+        decoders[frame.streamId] = new GrpcFrameDecoder()
+    }
+    var dec: GrpcFrameDecoder = decoders[frame.streamId]
+    dec.push(stripDataPadding(frame))
+    var msg: GrpcMessage? = dec.next()
+    while (msg != null) {
+        st._inbound.send(msg)
+        msg = dec.next()
+    }
+    if ((frame.flags & FLAG_END_STREAM) != 0) {
+        st._closeInbound()
+        if (h._isServer) {
+            // Bound the stream table; the handler holds its own reference.
+            h._streams.delete(frame.streamId)
+            decoders.delete(frame.streamId)
+        }
+    }
+}
+
+// Handle an inbound RST_STREAM.
+function _routeReset(h: Http2Conn, frame: Http2Frame, decoders: map[int]GrpcFrameDecoder): void {
+    if (!h._streams.has(frame.streamId)) {
+        return
+    }
+    var st: Http2Stream = h._streams[frame.streamId]
+    st._closeInbound()
+    var end: Http2StreamEnd = { status: 1, message: "stream reset by peer", trailers: noHeaders(), reset: true }
+    st._finish(end)
+    h._streams.delete(frame.streamId)
+    decoders.delete(frame.streamId)
+}
+
+// Tear down the connection: unblock all waiters and stop the mux.
+function _teardown(h: Http2Conn): void {
+    var keys: []int = h._streams.keys()
+    var i: int = 0
+    while (i < keys.length) {
+        var sid: int = keys[i]
+        var st: Http2Stream = h._streams[sid]
+        st._closeInbound()
+        if (!h._isServer) {
+            var end: Http2StreamEnd = { status: 14, message: "connection closed", trailers: noHeaders(), reset: false }
+            st._finish(end)
+        }
+        i = i + 1
+    }
+    h._accept.close()
+    h._events.send(mkClose())
+}
