@@ -18,6 +18,7 @@
 
 import { TcpConnection, TcpServer } from "std/net"
 import { Buffer } from "std/buffer"
+import { compress } from "std/compress"
 import { time } from "std/time"
 import { HpackHeader } from "./hpack.chuks"
 import { GrpcMessage } from "./framing.chuks"
@@ -223,7 +224,6 @@ function mkReply(data: Buffer, status: int, message: string, headers: []HpackHea
     return r
 }
 
-
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 function emptyBuf(): Buffer {
@@ -347,6 +347,55 @@ function responseHeaders(): []HpackHeader {
     return hs
 }
 
+// ─── Message compression (grpc-encoding negotiation) ───────────────────────
+// gRPC negotiates per-message compression via two headers:
+//   • grpc-encoding         — the codec used for outbound messages ("gzip" or
+//                             "identity"); also set on responses by the server.
+//   • grpc-accept-encoding  — a comma list of codecs the sender can decode.
+// Each length-prefixed frame carries a 1-byte "compressed" flag, so the receiver
+// decodes purely from that flag (we only ship the gzip codec, so a set flag
+// always means gzip). Tiny payloads can grow once framed/compressed; that is
+// expected and harmless.
+
+export const ENCODING_IDENTITY: string = "identity"
+export const ENCODING_GZIP: string = "gzip"
+
+// The codecs this implementation advertises it can decode, most-preferred first.
+function acceptEncodingHeader(): string {
+    return "gzip,identity"
+}
+
+// True if `headerValue` (a grpc-accept-encoding list) advertises gzip support.
+function acceptsGzip(headerValue: string): bool {
+    return headerValue.indexOf("gzip") >= 0
+}
+
+// Normalise a user-supplied codec name to one we support ("gzip" | "identity").
+function normalizeEncoding(encoding: string): string {
+    if (encoding == ENCODING_GZIP) {
+        return ENCODING_GZIP
+    }
+    return ENCODING_IDENTITY
+}
+
+// Send `data` on `st`, compressing with the negotiated `encoding` when gzip.
+function sendEncoded(st: Http2Stream, data: Buffer, encoding: string): void {
+    if (encoding == ENCODING_GZIP) {
+        st.sendMessageEncoded(compress.gzip(data), true)
+    } else {
+        st.sendMessage(data)
+    }
+}
+
+// Decode an inbound message: decompress when its compressed flag is set (the
+// only codec we negotiate is gzip), otherwise return the raw bytes.
+function decodeMessage(m: GrpcMessage): Buffer {
+    if (m.compressed) {
+        return compress.gunzip(m.data)
+    }
+    return m.data
+}
+
 // ─── RPC kinds ─────────────────────────────────────────────────────────────
 
 export const RPC_UNARY: int = 0
@@ -368,8 +417,9 @@ export class GrpcServerStream {
     var _cancelObserved: bool
     var _respHeaders: []HpackHeader
     var _respTrailers: []HpackHeader
+    var _respEncoding: string
 
-    constructor(st: Http2Stream, method: string, meta: []HpackHeader) {
+    constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool) {
         this._st = st
         this._method = method
         this._meta = meta
@@ -380,6 +430,15 @@ export class GrpcServerStream {
         this._respHeaders = hh
         var tt: []HpackHeader = []
         this._respTrailers = tt
+        // Compress responses only when the server opted in AND the client
+        // advertised it can decode gzip (grpc-accept-encoding).
+        this._respEncoding = ENCODING_IDENTITY
+        if (serverCompress) {
+            var accept: string = findHeader(meta, "grpc-accept-encoding")
+            if (acceptsGzip(accept)) {
+                this._respEncoding = ENCODING_GZIP
+            }
+        }
     }
 
     // The full method path, e.g. "/package.Service/Method".
@@ -395,6 +454,17 @@ export class GrpcServerStream {
     // The request's user metadata (reserved/protocol headers removed).
     public requestMetadata(): Metadata {
         return metadataFromHeaders(this._meta)
+    }
+
+    // The codec used for the client's request messages ("gzip" | "identity").
+    public requestEncoding(): string {
+        var enc: string = findHeader(this._meta, "grpc-encoding")
+        return normalizeEncoding(enc)
+    }
+
+    // The codec used for this stream's response messages ("gzip" | "identity").
+    public responseEncoding(): string {
+        return this._respEncoding
     }
 
     // First value of a request header by (case-insensitive) key, or "".
@@ -440,7 +510,7 @@ export class GrpcServerStream {
     // has elapsed. Long-running streaming handlers should poll this and return
     // promptly so work isn't wasted on an abandoned call. The cancellation is
     // observed via the stream's one-shot terminal signal (delivered by the
-    // transport reader on reset) and memoised here.
+        // transport reader on reset) and memoised here.
     public cancelled(): bool {
         if (this._cancelObserved) {
             return true
@@ -460,7 +530,7 @@ export class GrpcServerStream {
     public recv(): Buffer? {
         var m: GrpcMessage? = this._st.recv()
         if (m != null) {
-            return m.data
+            return decodeMessage(m)
         }
         return null
     }
@@ -470,6 +540,9 @@ export class GrpcServerStream {
         if (!this._headersSent) {
             this._headersSent = true
             var hs: []HpackHeader = responseHeaders()
+            if (this._respEncoding == ENCODING_GZIP) {
+                hs.push(hdr("grpc-encoding", "gzip"))
+            }
             var i: int = 0
             while (i < this._respHeaders.length) {
                 hs.push(this._respHeaders[i])
@@ -482,7 +555,7 @@ export class GrpcServerStream {
     // Send one response message on the stream.
     public send(data: Buffer): void {
         this._ensureHeaders()
-        this._st.sendMessage(data)
+        sendEncoded(this._st, data, this._respEncoding)
     }
 
     // Finish the RPC with a status and message (sends trailers, ends stream).
@@ -504,6 +577,7 @@ export class GrpcServer {
     var _server: TcpServer
     var _handlers: map[string]any
     var _kinds: map[string]int
+    var _compress: bool
 
     // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
     // it back via addr().
@@ -511,6 +585,14 @@ export class GrpcServer {
         this._server = new TcpServer(host, port)
         this._handlers = {}
         this._kinds = {}
+        this._compress = false
+    }
+
+    // Opt in to response compression. When enabled, responses are gzip-compressed
+    // for clients that advertise gzip support via grpc-accept-encoding; other
+    // clients still receive identity (uncompressed) messages.
+    public enableCompression(): void {
+        this._compress = true
     }
 
     // Register a unary handler:
@@ -587,7 +669,7 @@ async function _serveConn(srv: GrpcServer, conn: TcpConnection): Task<void> {
 // Dispatch a single accepted stream to its registered handler.
 async function _serveStream(srv: GrpcServer, st: Http2Stream): Task<void> {
     var path: string = findHeader(st.initialMeta, ":path")
-    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta)
+    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta, srv._compress)
 
     if (!srv._handlers.has(path)) {
         ss.finish(STATUS_UNIMPLEMENTED, "method not found: " + path)
@@ -646,13 +728,15 @@ export class GrpcClientCall {
     var _deadlineMs: int   // absolute deadline (ms since epoch); 0 = none
     var _cancelled: bool   // set by cancel()
     var _trailers: []HpackHeader   // captured at result()
+    var _encoding: string  // outbound message codec ("gzip" | "identity")
 
-    constructor(st: Http2Stream) {
+    constructor(st: Http2Stream, encoding: string) {
         this._st = st
         this._deadlineMs = 0
         this._cancelled = false
         var tt: []HpackHeader = []
         this._trailers = tt
+        this._encoding = encoding
     }
 
     // Attach an absolute deadline (ms since epoch). Called by the client openers
@@ -680,7 +764,7 @@ export class GrpcClientCall {
 
     // Send one request message on the stream.
     public send(data: Buffer): void {
-        this._st.sendMessage(data)
+        sendEncoded(this._st, data, this._encoding)
     }
 
     // Close the send side (half-close): no more request messages.
@@ -692,7 +776,7 @@ export class GrpcClientCall {
     public recv(): Buffer? {
         var m: GrpcMessage? = this._st.recv()
         if (m != null) {
-            return m.data
+            return decodeMessage(m)
         }
         return null
     }
@@ -741,6 +825,7 @@ export class GrpcClient {
     var _conn: TcpConnection
     var _h2: Http2Conn
     var _authority: string
+    var _encoding: string   // outbound request message codec ("gzip" | "identity")
 
     // Connect over cleartext HTTP/2 (h2c), exchange the preface, and start the
     // multiplexing reader/mux tasks.
@@ -750,11 +835,21 @@ export class GrpcClient {
         this._h2 = new Http2Conn(this._conn, false)
         this._h2.clientHandshake()
         this._h2.start()
+        this._encoding = ENCODING_IDENTITY
     }
 
     public close(): void {
         this._h2.close()
         this._conn.close()
+    }
+
+    // Opt in to request compression. When set to "gzip", outbound request messages
+    // are gzip-compressed and the call advertises `grpc-encoding: gzip`. Any value
+    // other than "gzip" resets to identity (uncompressed). Clients always advertise
+    // `grpc-accept-encoding: gzip,identity`, so a compressed response is decoded
+    // regardless of the request codec.
+    public setCompression(encoding: string): void {
+        this._encoding = normalizeEncoding(encoding)
     }
 
     // Open a raw stream for `method` (request HEADERS sent, body not yet).
@@ -769,7 +864,13 @@ export class GrpcClient {
 
     // Open a raw stream carrying a timeout and custom request metadata.
     private _openM(method: string, timeoutMs: int, md: Metadata): Http2Stream {
-        return this._h2.openStream(requestHeadersM(method, this._authority, timeoutMs, md))
+        var hs: []HpackHeader = requestHeadersM(method, this._authority, timeoutMs, md)
+        // Advertise the codecs we can decode, and announce our request codec.
+        hs.push(hdr("grpc-accept-encoding", acceptEncodingHeader()))
+        if (this._encoding == ENCODING_GZIP) {
+            hs.push(hdr("grpc-encoding", "gzip"))
+        }
+        return this._h2.openStream(hs)
     }
 
     // Unary RPC: send one request, await one reply.
@@ -795,13 +896,13 @@ export class GrpcClient {
 
     private _unaryCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
         var st: Http2Stream = this._openM(method, timeoutMs, md)
-        st.sendMessage(message)
+        sendEncoded(st, message, this._encoding)
         st.closeSend()
         if (timeoutMs <= 0) {
             var respData: Buffer = emptyBuf()
             var m: GrpcMessage? = st.recv()
             if (m != null) {
-                respData = m.data
+                respData = decodeMessage(m)
             }
             // Drain any trailing messages so the stream reaches its terminal state.
             var extra: GrpcMessage? = st.recv()
@@ -816,7 +917,7 @@ export class GrpcClient {
         while (true) {
             var dm: GrpcMessage? = st.tryRecv()
             if (dm != null) {
-                got = dm.data
+                got = decodeMessage(dm)
             }
             var de: Http2StreamEnd? = st.tryResult()
             if (de != null) {
@@ -847,9 +948,9 @@ export class GrpcClient {
 
     private _serverStreamCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcClientCall {
         var st: Http2Stream = this._openM(method, timeoutMs, md)
-        st.sendMessage(message)
+        sendEncoded(st, message, this._encoding)
         st.closeSend()
-        var call: GrpcClientCall = new GrpcClientCall(st)
+        var call: GrpcClientCall = new GrpcClientCall(st, this._encoding)
         if (timeoutMs > 0) {
             call._setDeadline(time.now() + timeoutMs)
         }
@@ -873,7 +974,7 @@ export class GrpcClient {
 
     private _clientStreamCore(method: string, md: Metadata, timeoutMs: int): GrpcClientCall {
         var st: Http2Stream = this._openM(method, timeoutMs, md)
-        var call: GrpcClientCall = new GrpcClientCall(st)
+        var call: GrpcClientCall = new GrpcClientCall(st, this._encoding)
         if (timeoutMs > 0) {
             call._setDeadline(time.now() + timeoutMs)
         }
@@ -896,7 +997,7 @@ export class GrpcClient {
 
     private _bidiStreamCore(method: string, md: Metadata, timeoutMs: int): GrpcClientCall {
         var st: Http2Stream = this._openM(method, timeoutMs, md)
-        var call: GrpcClientCall = new GrpcClientCall(st)
+        var call: GrpcClientCall = new GrpcClientCall(st, this._encoding)
         if (timeoutMs > 0) {
             call._setDeadline(time.now() + timeoutMs)
         }

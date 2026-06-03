@@ -144,6 +144,23 @@ function metaStreamHandler(req: GrpcRequest, stream: GrpcServerStream): void {
     stream.setTrailer("x-trailer", "done")
 }
 
+// Server-streaming handler that reports the negotiated request/response codecs
+// ("gzip" | "identity") so the client can assert the negotiation outcome.
+function encReportHandler(req: GrpcRequest, stream: GrpcServerStream): void {
+    stream.send(encodeName("req=" + stream.requestEncoding() + ";resp=" + stream.responseEncoding()))
+}
+
+// Unary handler returning a large, highly compressible payload.
+function bigHandler(req: GrpcRequest): GrpcResponse {
+    var s: string = ""
+    var i: int = 0
+    while (i < 200) {
+        s = s + "abcdefghij"
+        i = i + 1
+    }
+    return grpcOk(encodeName(s))
+}
+
 // Run a single connection's worth of serving on a background task.
 async function runServer(srv: GrpcServer): Task<void> {
     srv.serveOnce()
@@ -400,6 +417,129 @@ try {
     await t13
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 13 response metadata — " + string(e)) }
+
+// 14 — client gzip request: server decodes a gzip-compressed request body
+try {
+    var srv14: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv14.register("/echo.Echo/Say", sayHandler)
+    var port14: int = portOf(srv14.addr())
+    var t14: Task<void> = spawn runServer(srv14)
+
+    var client14: GrpcClient = new GrpcClient("127.0.0.1", port14)
+    client14.setCompression("gzip")   // compress outbound request messages
+    var rep14: GrpcReply = client14.unary("/echo.Echo/Say", encodeName("world"))
+    test.assertEqual(rep14.status, STATUS_OK)
+    test.assertEqual(decodeName(rep14.data), "hello, world")
+    client14.close()
+    await t14
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 14 client gzip request — " + string(e)) }
+
+// 15 — server gzip response: client decodes a gzip-compressed response body
+try {
+    var srv15: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv15.enableCompression()         // compress responses for gzip-capable clients
+    srv15.register("/echo.Echo/Big", bigHandler)
+    var port15: int = portOf(srv15.addr())
+    var t15: Task<void> = spawn runServer(srv15)
+
+    var client15: GrpcClient = new GrpcClient("127.0.0.1", port15)
+    // identity request, but the client always advertises grpc-accept-encoding: gzip
+    var rep15: GrpcReply = client15.unary("/echo.Echo/Big", encodeName("x"))
+    test.assertEqual(rep15.status, STATUS_OK)
+    var s15: string = ""
+    var i15: int = 0
+    while (i15 < 200) { s15 = s15 + "abcdefghij"; i15 = i15 + 1 }
+    test.assertEqual(decodeName(rep15.data), s15)
+    client15.close()
+    await t15
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 15 server gzip response — " + string(e)) }
+
+// 16 — both directions gzip: compressed request and compressed response
+try {
+    var srv16: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv16.enableCompression()
+    srv16.register("/echo.Echo/Say", sayHandler)
+    var port16: int = portOf(srv16.addr())
+    var t16: Task<void> = spawn runServer(srv16)
+
+    var client16: GrpcClient = new GrpcClient("127.0.0.1", port16)
+    client16.setCompression("gzip")
+    var rep16: GrpcReply = client16.unary("/echo.Echo/Say", encodeName("ada"))
+    test.assertEqual(rep16.status, STATUS_OK)
+    test.assertEqual(decodeName(rep16.data), "hello, ada")
+    client16.close()
+    await t16
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 16 bidirectional gzip — " + string(e)) }
+
+// 17 — negotiation outcome: server reports req=gzip;resp=gzip when both opt in
+try {
+    var srv17: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv17.enableCompression()
+    srv17.registerServerStream("/echo.Echo/Enc", encReportHandler)
+    var port17: int = portOf(srv17.addr())
+    var t17: Task<void> = spawn runServer(srv17)
+
+    var client17: GrpcClient = new GrpcClient("127.0.0.1", port17)
+    client17.setCompression("gzip")
+    var call17: GrpcClientCall = client17.serverStream("/echo.Echo/Enc", encodeName("x"))
+    var first17: Buffer? = call17.recv()
+    var report17: string = ""
+    if (first17 != null) { report17 = decodeName(first17) }
+    var rep17: GrpcReply = call17.result()
+    test.assertEqual(rep17.status, STATUS_OK)
+    test.assertEqual(report17, "req=gzip;resp=gzip")
+    client17.close()
+    await t17
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 17 negotiation outcome — " + string(e)) }
+
+// 18 — identity negotiation: no opt-in -> req=identity;resp=identity
+try {
+    var srv18: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv18.registerServerStream("/echo.Echo/Enc", encReportHandler)
+    var port18: int = portOf(srv18.addr())
+    var t18: Task<void> = spawn runServer(srv18)
+
+    var client18: GrpcClient = new GrpcClient("127.0.0.1", port18)
+    var call18: GrpcClientCall = client18.serverStream("/echo.Echo/Enc", encodeName("x"))
+    var first18: Buffer? = call18.recv()
+    var report18: string = ""
+    if (first18 != null) { report18 = decodeName(first18) }
+    var rep18: GrpcReply = call18.result()
+    test.assertEqual(rep18.status, STATUS_OK)
+    test.assertEqual(report18, "req=identity;resp=identity")
+    client18.close()
+    await t18
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 18 identity negotiation — " + string(e)) }
+
+// 19 — gzip server-streaming: compressed fan-out decoded message-by-message
+try {
+    var srv19: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv19.enableCompression()
+    srv19.registerServerStream("/echo.Echo/Count", countHandler)
+    var port19: int = portOf(srv19.addr())
+    var t19: Task<void> = spawn runServer(srv19)
+
+    var client19: GrpcClient = new GrpcClient("127.0.0.1", port19)
+    client19.setCompression("gzip")
+    var call19: GrpcClientCall = client19.serverStream("/echo.Echo/Count", encodeName("x"))
+    var acc19: string = ""
+    var m19: Buffer? = call19.recv()
+    while (m19 != null) {
+        acc19 = acc19 + decodeName(m19) + ","
+        m19 = call19.recv()
+    }
+    var rep19: GrpcReply = call19.result()
+    test.assertEqual(rep19.status, STATUS_OK)
+    test.assertEqual(acc19, "x0,x1,x2,")
+    client19.close()
+    await t19
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 19 gzip server-stream — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

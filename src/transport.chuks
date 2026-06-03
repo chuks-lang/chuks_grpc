@@ -36,7 +36,7 @@ import {
     rstStreamFrame, goawayFrame, pingFrame, parseSettings, parseWindowUpdate
 } from "./http2.chuks"
 import { HpackEncoder, HpackDecoder, HpackHeader } from "./hpack.chuks"
-import { GrpcFrameDecoder, GrpcMessage, frameMessage } from "./framing.chuks"
+import { GrpcFrameDecoder, GrpcMessage, frameMessage, encodeMessage } from "./framing.chuks"
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -193,7 +193,7 @@ export class Http2Stream {
 
     // Non-blocking poll for the next inbound message. Returns null when nothing
     // is immediately available (which is ambiguous with end-of-stream — callers
-    // racing a deadline should also poll tryResult() for the terminal end).
+        // racing a deadline should also poll tryResult() for the terminal end).
     public tryRecv(): GrpcMessage? {
         var res: any = this._inbound.tryReceive()
         var ok: bool = res["ok"]
@@ -233,6 +233,15 @@ export class Http2Stream {
     // Send one gRPC message on this stream (length-prefixed + flow-controlled).
     public sendMessage(data: Buffer): void {
         var framed: Buffer = frameMessage(data)
+        var ev: MuxEvent = mkData(this.id, framed, false)
+        this._events.send(ev)
+    }
+
+    // Send one gRPC message with an explicit compressed flag. `data` must already
+    // be the codec output (e.g. gzip-compressed) when `compressed` is true; the
+    // framing layer only sets the 1-byte compressed marker on the message header.
+    public sendMessageEncoded(data: Buffer, compressed: bool): void {
+        var framed: Buffer = encodeMessage(data, compressed)
         var ev: MuxEvent = mkData(this.id, framed, false)
         this._events.send(ev)
     }
