@@ -120,8 +120,10 @@ is no `.proto` codegen).
 
 ### Shared message helpers
 
-Every example below uses these two tiny helpers for the message
-`{ string value = 1; }`. Define them once and reuse them:
+`encStr` / `decStr` are **your own helper functions** (not part of the package) —
+they encode and decode the protobuf message `{ string value = 1; }` using
+`ProtoWriter` / `ProtoReader`. Define them once; **every snippet below reuses
+them** (and assumes `Buffer` is imported), so they aren't repeated each time:
 
 ```chuks
 import { Buffer } from "std/buffer"
