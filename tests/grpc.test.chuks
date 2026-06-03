@@ -10,8 +10,8 @@ import {
     GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
     GrpcServerStream, GrpcClientCall,
     Metadata, metadataFromHeaders,
-    grpcOk,
-    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED
+    grpcOk, grpcError,
+    STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED
 } from "../src/index.chuks"
 import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
 import { tlsSelfSigned } from "std/net"
@@ -172,6 +172,45 @@ async function runServer(srv: GrpcServer): Task<void> {
 // cert, cn= for plaintext / server-only TLS).
 function peerHandler(req: GrpcRequest): GrpcResponse {
     return grpcOk(encodeName("cn=" + req.peerCN))
+}
+
+// ── Interceptor fixtures (M11) ──────────────────────────────────────────────
+
+// Server unary interceptor that wraps the response body in "A(...)".
+function wrapA(req: GrpcRequest, next: any): GrpcResponse {
+    var resp: GrpcResponse = next(req)
+    return grpcOk(encodeName("A(" + decodeName(resp.data) + ")"))
+}
+
+// Server unary interceptor that wraps the response body in "B(...)".
+function wrapB(req: GrpcRequest, next: any): GrpcResponse {
+    var resp: GrpcResponse = next(req)
+    return grpcOk(encodeName("B(" + decodeName(resp.data) + ")"))
+}
+
+// Server unary interceptor that short-circuits with UNAUTHENTICATED, never
+// calling `next` (so the handler must not run).
+function denyAuth(req: GrpcRequest, next: any): GrpcResponse {
+    return grpcError(STATUS_UNAUTHENTICATED, "no token")
+}
+
+// Client unary interceptor that appends "!" to the request message before
+// issuing the RPC.
+function bangRequest(method: string, message: Buffer, md: Metadata, next: any): GrpcReply {
+    return next(method, encodeName(decodeName(message) + "!"), md)
+}
+
+// Client unary interceptor that wraps the reply body in "wrapped:...".
+function wrapReply(method: string, message: Buffer, md: Metadata, next: any): GrpcReply {
+    var rep: GrpcReply = next(method, message, md)
+    var out: GrpcReply = { data: encodeName("wrapped:" + decodeName(rep.data)), status: rep.status, message: rep.message, headers: rep.headers, trailers: rep.trailers }
+    return out
+}
+
+// Server stream interceptor that tags the response with a header, then proceeds.
+function tagStream(stream: GrpcServerStream, next: any): void {
+    stream.setHeader("x-intercepted", "yes")
+    next(stream)
 }
 
 // 1 — unary round-trip echo
@@ -611,6 +650,100 @@ try {
     test.assertEqual(rejected22, true)
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 22 mTLS rejection — " + string(e)) }
+
+// 23 — server unary interceptors run outermost-first around the handler
+try {
+    var srv23: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv23.register("/echo.Echo/Say", sayHandler)
+    srv23.useUnaryInterceptor(wrapA)
+    srv23.useUnaryInterceptor(wrapB)
+    var port23: int = portOf(srv23.addr())
+    var t23: Task<void> = spawn runServer(srv23)
+
+    var client23: GrpcClient = new GrpcClient("127.0.0.1", port23)
+    var rep23: GrpcReply = client23.unary("/echo.Echo/Say", encodeName("world"))
+    test.assertEqual(rep23.status, STATUS_OK)
+    test.assertEqual(decodeName(rep23.data), "A(B(hello, world))")
+    client23.close()
+    await t23
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 23 server unary interceptor order — " + string(e)) }
+
+// 24 — server unary interceptor short-circuits (auth deny, handler never runs)
+try {
+    var srv24: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv24.register("/echo.Echo/Say", sayHandler)
+    srv24.useUnaryInterceptor(denyAuth)
+    var port24: int = portOf(srv24.addr())
+    var t24: Task<void> = spawn runServer(srv24)
+
+    var client24: GrpcClient = new GrpcClient("127.0.0.1", port24)
+    var rep24: GrpcReply = client24.unary("/echo.Echo/Say", encodeName("world"))
+    test.assertEqual(rep24.status, STATUS_UNAUTHENTICATED)
+    test.assertEqual(rep24.message, "no token")
+    client24.close()
+    await t24
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 24 server interceptor short-circuit — " + string(e)) }
+
+// 25 — client unary interceptor rewrites the outbound request message
+try {
+    var srv25: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv25.register("/echo.Echo/Say", sayHandler)
+    var port25: int = portOf(srv25.addr())
+    var t25: Task<void> = spawn runServer(srv25)
+
+    var client25: GrpcClient = new GrpcClient("127.0.0.1", port25)
+    client25.useUnaryInterceptor(bangRequest)
+    var rep25: GrpcReply = client25.unary("/echo.Echo/Say", encodeName("world"))
+    test.assertEqual(rep25.status, STATUS_OK)
+    test.assertEqual(decodeName(rep25.data), "hello, world!")
+    client25.close()
+    await t25
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 25 client interceptor rewrites request — " + string(e)) }
+
+// 26 — client unary interceptor post-processes the reply
+try {
+    var srv26: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv26.register("/echo.Echo/Say", sayHandler)
+    var port26: int = portOf(srv26.addr())
+    var t26: Task<void> = spawn runServer(srv26)
+
+    var client26: GrpcClient = new GrpcClient("127.0.0.1", port26)
+    client26.useUnaryInterceptor(wrapReply)
+    var rep26: GrpcReply = client26.unary("/echo.Echo/Say", encodeName("world"))
+    test.assertEqual(rep26.status, STATUS_OK)
+    test.assertEqual(decodeName(rep26.data), "wrapped:hello, world")
+    client26.close()
+    await t26
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 26 client interceptor post-processes reply — " + string(e)) }
+
+// 27 — server stream interceptor wraps a server-streaming handler
+try {
+    var srv27: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv27.registerServerStream("/echo.Echo/Count", countHandler)
+    srv27.useStreamInterceptor(tagStream)
+    var port27: int = portOf(srv27.addr())
+    var t27: Task<void> = spawn runServer(srv27)
+
+    var client27: GrpcClient = new GrpcClient("127.0.0.1", port27)
+    var call27: GrpcClientCall = client27.serverStream("/echo.Echo/Count", encodeName("n"))
+    var got27: int = 0
+    var m27: Buffer? = call27.recv()
+    while (m27 != null) {
+        got27 = got27 + 1
+        m27 = call27.recv()
+    }
+    var rep27: GrpcReply = call27.result()
+    test.assertEqual(rep27.status, STATUS_OK)
+    test.assertEqual(got27, 3)
+    test.assertEqual(call27.headers().get("x-intercepted"), "yes")
+    client27.close()
+    await t27
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 27 server stream interceptor — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

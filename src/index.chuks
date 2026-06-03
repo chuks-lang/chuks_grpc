@@ -590,6 +590,8 @@ export class GrpcServer {
     var _handlers: map[string]any
     var _kinds: map[string]int
     var _compress: bool
+    var _unaryInterceptors: []any   // function(req: GrpcRequest, next: any): GrpcResponse
+    var _streamInterceptors: []any  // function(stream: GrpcServerStream, next: any): void
 
     // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
     // it back via addr(). Provide tlsOptions to serve over TLS/mTLS instead of
@@ -604,6 +606,8 @@ export class GrpcServer {
         this._handlers = {}
         this._kinds = {}
         this._compress = false
+        this._unaryInterceptors = []
+        this._streamInterceptors = []
     }
 
     // Opt in to response compression. When enabled, responses are gzip-compressed
@@ -611,6 +615,24 @@ export class GrpcServer {
     // clients still receive identity (uncompressed) messages.
     public enableCompression(): void {
         this._compress = true
+    }
+
+    // Register a unary server interceptor. Interceptors run in registration
+    // order (outermost first) around every unary handler:
+    //   function(req: GrpcRequest, next: any): GrpcResponse
+    // Call `next(req)` to proceed to the next interceptor (and finally the
+    // handler); return a GrpcResponse without calling `next` to short-circuit.
+    public useUnaryInterceptor(interceptor: any): void {
+        this._unaryInterceptors.push(interceptor)
+    }
+
+    // Register a streaming server interceptor. Wraps every server-streaming,
+    // client-streaming and bidi handler in registration order:
+    //   function(stream: GrpcServerStream, next: any): void
+    // Call `next(stream)` to proceed. An interceptor that short-circuits (does
+    // not call `next`) is responsible for finishing the stream itself.
+    public useStreamInterceptor(interceptor: any): void {
+        this._streamInterceptors.push(interceptor)
     }
 
     // Register a unary handler:
@@ -708,7 +730,10 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
                 reqData = m
             }
             var req: GrpcRequest = { method: path, data: reqData, metadata: st.initialMeta, deadlineMs: ss.deadlineMs(), peerCN: peerCN }
-            var resp: GrpcResponse = handler(req)
+            var unaryTerminal = function(rq: GrpcRequest): GrpcResponse {
+                return handler(rq)
+            }
+            var resp: GrpcResponse = _runServerUnary(srv._unaryInterceptors, 0, req, unaryTerminal)
             if (resp.status != STATUS_OK) {
                 ss.finish(resp.status, resp.message)
             } else {
@@ -722,23 +747,80 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
                 reqData2 = m2
             }
             var req2: GrpcRequest = { method: path, data: reqData2, metadata: st.initialMeta, deadlineMs: ss.deadlineMs(), peerCN: peerCN }
-            handler(req2, ss)
-            ss.finish(STATUS_OK, "")
-        } else if (kind == RPC_CLIENT_STREAM) {
-            var resp3: GrpcResponse = handler(ss)
-            if (resp3.status != STATUS_OK) {
-                ss.finish(resp3.status, resp3.message)
-            } else {
-                ss.send(resp3.data)
-                ss.finish(STATUS_OK, "")
+            var ssTerminal = function(s: GrpcServerStream): void {
+                handler(req2, s)
+                s.finish(STATUS_OK, "")
             }
+            _runServerStream(srv._streamInterceptors, 0, ss, ssTerminal)
+        } else if (kind == RPC_CLIENT_STREAM) {
+            var csTerminal = function(s: GrpcServerStream): void {
+                var resp3: GrpcResponse = handler(s)
+                if (resp3.status != STATUS_OK) {
+                    s.finish(resp3.status, resp3.message)
+                } else {
+                    s.send(resp3.data)
+                    s.finish(STATUS_OK, "")
+                }
+            }
+            _runServerStream(srv._streamInterceptors, 0, ss, csTerminal)
         } else {
-            handler(ss)
-            ss.finish(STATUS_OK, "")
+            var bidiTerminal = function(s: GrpcServerStream): void {
+                handler(s)
+                s.finish(STATUS_OK, "")
+            }
+            _runServerStream(srv._streamInterceptors, 0, ss, bidiTerminal)
         }
     } catch (e) {
         ss.finish(STATUS_INTERNAL, string(e))
     }
+}
+
+// ─── Interceptor chains ─────────────────────────────────────────────────────
+// These are module-level recursive helpers (not class methods) so the captured
+// `next` closures never reach into private class state — keeping them valid
+// under the access rules the typechecker enforces in both VM and AOT.
+
+// Drive the server unary interceptor chain. `interceptors[idx]` has signature
+// function(req: GrpcRequest, next: any): GrpcResponse; `terminal` is the actual
+// handler call function(req: GrpcRequest): GrpcResponse.
+function _runServerUnary(interceptors: []any, idx: int, req: GrpcRequest, terminal: any): GrpcResponse {
+    if (idx >= interceptors.length) {
+        return terminal(req)
+    }
+    var interceptor: any = interceptors[idx]
+    var next = function(r: GrpcRequest): GrpcResponse {
+        return _runServerUnary(interceptors, idx + 1, r, terminal)
+    }
+    return interceptor(req, next)
+}
+
+// Drive the server streaming interceptor chain. `interceptors[idx]` has
+// signature function(stream: GrpcServerStream, next: any): void; `terminal`
+// performs the handler call and finishes the stream.
+function _runServerStream(interceptors: []any, idx: int, ss: GrpcServerStream, terminal: any): void {
+    if (idx >= interceptors.length) {
+        terminal(ss)
+        return
+    }
+    var interceptor: any = interceptors[idx]
+    var next = function(s: GrpcServerStream): void {
+        _runServerStream(interceptors, idx + 1, s, terminal)
+    }
+    interceptor(ss, next)
+}
+
+// Drive the client unary interceptor chain. `interceptors[idx]` has signature
+// function(method: string, message: Buffer, md: Metadata, next: any): GrpcReply;
+// `terminal` issues the real RPC: function(method, message, md): GrpcReply.
+function _runClientUnary(interceptors: []any, idx: int, method: string, message: Buffer, md: Metadata, terminal: any): GrpcReply {
+    if (idx >= interceptors.length) {
+        return terminal(method, message, md)
+    }
+    var interceptor: any = interceptors[idx]
+    var next = function(m: string, msg: Buffer, d: Metadata): GrpcReply {
+        return _runClientUnary(interceptors, idx + 1, m, msg, d, terminal)
+    }
+    return interceptor(method, message, md, next)
 }
 
 // ─── Client-side stream handle ─────────────────────────────────────────────
@@ -847,6 +929,7 @@ export class GrpcClient {
     var _h2: Http2Conn
     var _authority: string
     var _encoding: string   // outbound request message codec ("gzip" | "identity")
+    var _unaryInterceptors: []any   // function(method: string, message: Buffer, md: Metadata, next: any): GrpcReply
 
     // Connect over HTTP/2, exchange the preface, and start the multiplexing
     // reader/mux tasks. Without tlsOptions this is cleartext h2c; pass tlsOptions
@@ -863,6 +946,7 @@ export class GrpcClient {
         this._h2.clientHandshake()
         this._h2.start()
         this._encoding = ENCODING_IDENTITY
+        this._unaryInterceptors = []
     }
 
     public close(): void {
@@ -877,6 +961,16 @@ export class GrpcClient {
     // regardless of the request codec.
     public setCompression(encoding: string): void {
         this._encoding = normalizeEncoding(encoding)
+    }
+
+    // Register a unary client interceptor. Interceptors run in registration
+    // order (outermost first) around every unary call:
+    //   function(method: string, message: Buffer, md: Metadata, next: any): GrpcReply
+    // Call `next(method, message, md)` to issue the RPC (possibly with modified
+    // arguments); inspect or replace the returned GrpcReply, or short-circuit by
+    // returning a GrpcReply without calling `next`.
+    public useUnaryInterceptor(interceptor: any): void {
+        this._unaryInterceptors.push(interceptor)
     }
 
     // Open a raw stream for `method` (request HEADERS sent, body not yet).
@@ -922,6 +1016,13 @@ export class GrpcClient {
     }
 
     private _unaryCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
+        var terminal = function(m: string, msg: Buffer, d: Metadata): GrpcReply {
+            return this._unaryDirect(m, msg, d, timeoutMs)
+        }
+        return _runClientUnary(this._unaryInterceptors, 0, method, message, md, terminal)
+    }
+
+    private _unaryDirect(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
         var st: Http2Stream = this._openM(method, timeoutMs, md)
         sendEncoded(st, message, this._encoding)
         st.closeSend()
