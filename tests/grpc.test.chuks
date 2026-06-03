@@ -6,6 +6,7 @@ import { test } from "std/test"
 import { Buffer } from "std/buffer"
 import {
     GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
+    GrpcServerStream, GrpcClientCall,
     grpcOk,
     STATUS_OK, STATUS_UNIMPLEMENTED
 } from "../src/index.chuks"
@@ -62,6 +63,36 @@ function sayHandler(req: GrpcRequest): GrpcResponse {
     return grpcOk(encodeName("hello, " + name))
 }
 
+// Server-streaming handler: one request "name" -> three messages name0/1/2.
+function countHandler(req: GrpcRequest, stream: GrpcServerStream): void {
+    var name: string = decodeName(req.data)
+    var i: int = 0
+    while (i < 3) {
+        stream.send(encodeName(name + string(i)))
+        i = i + 1
+    }
+}
+
+// Client-streaming handler: drain all requests -> one reply "count=N".
+function collectHandler(stream: GrpcServerStream): GrpcResponse {
+    var count: int = 0
+    var m: Buffer? = stream.recv()
+    while (m != null) {
+        count = count + 1
+        m = stream.recv()
+    }
+    return grpcOk(encodeName("count=" + string(count)))
+}
+
+// Bidirectional handler: echo each request back as "echo:<name>".
+function chatHandler(stream: GrpcServerStream): void {
+    var m: Buffer? = stream.recv()
+    while (m != null) {
+        stream.send(encodeName("echo:" + decodeName(m)))
+        m = stream.recv()
+    }
+}
+
 // Run a single connection's worth of serving on a background task.
 async function runServer(srv: GrpcServer): Task<void> {
     srv.serveOnce()
@@ -113,6 +144,82 @@ try {
     await t3
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 3 empty message — " + string(e)) }
+
+// 4 — server-streaming: one request fans out to three responses
+try {
+    var srv4: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv4.registerServerStream("/echo.Echo/Count", countHandler)
+    var port4: int = portOf(srv4.addr())
+    var t4: Task<void> = spawn runServer(srv4)
+
+    var client4: GrpcClient = new GrpcClient("127.0.0.1", port4)
+    var call4: GrpcClientCall = client4.serverStream("/echo.Echo/Count", encodeName("x"))
+    var acc4: string = ""
+    var m4: Buffer? = call4.recv()
+    while (m4 != null) {
+        acc4 = acc4 + decodeName(m4) + ","
+        m4 = call4.recv()
+    }
+    var rep4: GrpcReply = call4.result()
+    test.assertEqual(rep4.status, STATUS_OK)
+    test.assertEqual(acc4, "x0,x1,x2,")
+    client4.close()
+    await t4
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 4 server-stream — " + string(e)) }
+
+// 5 — client-streaming: three requests aggregate into one reply
+try {
+    var srv5: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv5.registerClientStream("/echo.Echo/Collect", collectHandler)
+    var port5: int = portOf(srv5.addr())
+    var t5: Task<void> = spawn runServer(srv5)
+
+    var client5: GrpcClient = new GrpcClient("127.0.0.1", port5)
+    var call5: GrpcClientCall = client5.clientStream("/echo.Echo/Collect")
+    call5.send(encodeName("a"))
+    call5.send(encodeName("b"))
+    call5.send(encodeName("c"))
+    call5.closeSend()
+    var got5: string = ""
+    var m5: Buffer? = call5.recv()
+    if (m5 != null) {
+        got5 = decodeName(m5)
+    }
+    var rep5: GrpcReply = call5.result()
+    test.assertEqual(rep5.status, STATUS_OK)
+    test.assertEqual(got5, "count=3")
+    client5.close()
+    await t5
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 5 client-stream — " + string(e)) }
+
+// 6 — bidirectional streaming: three requests echoed back interleaved
+try {
+    var srv6: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv6.registerBidiStream("/echo.Echo/Chat", chatHandler)
+    var port6: int = portOf(srv6.addr())
+    var t6: Task<void> = spawn runServer(srv6)
+
+    var client6: GrpcClient = new GrpcClient("127.0.0.1", port6)
+    var call6: GrpcClientCall = client6.bidiStream("/echo.Echo/Chat")
+    call6.send(encodeName("1"))
+    call6.send(encodeName("2"))
+    call6.send(encodeName("3"))
+    call6.closeSend()
+    var acc6: string = ""
+    var m6: Buffer? = call6.recv()
+    while (m6 != null) {
+        acc6 = acc6 + decodeName(m6) + ","
+        m6 = call6.recv()
+    }
+    var rep6: GrpcReply = call6.result()
+    test.assertEqual(rep6.status, STATUS_OK)
+    test.assertEqual(acc6, "echo:1,echo:2,echo:3,")
+    client6.close()
+    await t6
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 6 bidi-stream — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")
