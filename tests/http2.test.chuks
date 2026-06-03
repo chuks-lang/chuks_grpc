@@ -1,0 +1,175 @@
+// ─── chuks_grpc · HTTP/2 frame layer tests ─────────────────────────────────
+
+import { test } from "std/test"
+import { Buffer } from "std/buffer"
+import {
+    Http2FrameDecoder, Http2Frame, Http2Setting,
+    encodeFrame, dataFrame, headersFrame, settingsFrame,
+    windowUpdateFrame, rstStreamFrame, goawayFrame, pingFrame,
+    parseSettings, parseWindowUpdate, parseRstStream, parseGoaway,
+    FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
+    FRAME_RST_STREAM, FRAME_GOAWAY, FRAME_PING,
+    FLAG_END_STREAM, FLAG_END_HEADERS, FLAG_ACK,
+    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_FRAME_SIZE,
+    ERR_NO_ERROR, ERR_CANCEL, CONNECTION_PREFACE
+} from "../src/http2.chuks"
+
+var passed: any = 0
+var failed: any = 0
+
+function setting(id: int, value: int): Http2Setting {
+    var s: Http2Setting = { id: id, value: value }
+    return s
+}
+
+// 1 — Frame header layout: length / type / flags / streamId
+try {
+    var payload = Buffer.fromArray([1, 2, 3])
+    var f: Buffer = encodeFrame(FRAME_DATA, FLAG_END_STREAM, 5, payload)
+    test.assertEqual(f.length(), 12) // 9 header + 3 payload
+    test.assertEqual(f.getByte(0), 0); test.assertEqual(f.getByte(1), 0); test.assertEqual(f.getByte(2), 3)
+    test.assertEqual(f.getByte(3), FRAME_DATA)
+    test.assertEqual(f.getByte(4), FLAG_END_STREAM)
+    test.assertEqual(f.getByte(8), 5) // stream id low byte
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 1 frame header — " + string(e)) }
+
+// 2 — Decoder round-trips a single frame
+try {
+    var dec = new Http2FrameDecoder()
+    dec.push(dataFrame(7, Buffer.fromArray([10, 20, 30, 40]), true))
+    var fr: Http2Frame? = dec.next()
+    test.assertEqual(fr != null, true)
+    if (fr != null) {
+        test.assertEqual(fr.ftype, FRAME_DATA)
+        test.assertEqual(fr.streamId, 7)
+        test.assertEqual((fr.flags & FLAG_END_STREAM) != 0, true)
+        test.assertEqual(fr.payload.length(), 4)
+        test.assertEqual(fr.payload.getByte(0), 10)
+        test.assertEqual(fr.payload.getByte(3), 40)
+    }
+    test.assertEqual(dec.next() == null, true)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 2 decode single — " + string(e)) }
+
+// 3 — Partial delivery: header split from payload
+try {
+    var full: Buffer = headersFrame(1, Buffer.fromArray([0x82, 0x88]), true, true)
+    var dec = new Http2FrameDecoder()
+    dec.push(full.slice(0, 5))   // only part of the header
+    test.assertEqual(dec.next() == null, true)
+    dec.push(full.slice(5, full.length()))
+    var fr: Http2Frame? = dec.next()
+    test.assertEqual(fr != null, true)
+    if (fr != null) {
+        test.assertEqual(fr.ftype, FRAME_HEADERS)
+        test.assertEqual((fr.flags & FLAG_END_HEADERS) != 0, true)
+        test.assertEqual((fr.flags & FLAG_END_STREAM) != 0, true)
+        test.assertEqual(fr.payload.length(), 2)
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 3 partial — " + string(e)) }
+
+// 4 — Coalesced frames in one read
+try {
+    var a: Buffer = settingsFrame([setting(SETTINGS_MAX_FRAME_SIZE, 16384)], false)
+    var b: Buffer = windowUpdateFrame(0, 65535)
+    var both: []Buffer = [a, b]
+    var dec = new Http2FrameDecoder()
+    dec.push(Buffer.concat(both))
+    var f1: Http2Frame? = dec.next()
+    var f2: Http2Frame? = dec.next()
+    test.assertEqual(f1 != null && f2 != null, true)
+    if (f1 != null) { test.assertEqual(f1.ftype, FRAME_SETTINGS) }
+    if (f2 != null) {
+        test.assertEqual(f2.ftype, FRAME_WINDOW_UPDATE)
+        test.assertEqual(parseWindowUpdate(f2.payload), 65535)
+    }
+    test.assertEqual(dec.next() == null, true)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 4 coalesced — " + string(e)) }
+
+// 5 — SETTINGS encode/parse round-trip
+try {
+    var s: []Http2Setting = [
+        setting(SETTINGS_INITIAL_WINDOW_SIZE, 1048576),
+        setting(SETTINGS_MAX_FRAME_SIZE, 16384)
+    ]
+    var dec = new Http2FrameDecoder()
+    dec.push(settingsFrame(s, false))
+    var fr: Http2Frame? = dec.next()
+    test.assertEqual(fr != null, true)
+    if (fr != null) {
+        var got: []Http2Setting = parseSettings(fr.payload)
+        test.assertEqual(got.length, 2)
+        test.assertEqual(got[0].id, SETTINGS_INITIAL_WINDOW_SIZE)
+        test.assertEqual(got[0].value, 1048576)
+        test.assertEqual(got[1].id, SETTINGS_MAX_FRAME_SIZE)
+        test.assertEqual(got[1].value, 16384)
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 5 settings — " + string(e)) }
+
+// 6 — SETTINGS ACK is an empty flagged frame
+try {
+    var dec = new Http2FrameDecoder()
+    dec.push(settingsFrame([], true))
+    var fr: Http2Frame? = dec.next()
+    test.assertEqual(fr != null, true)
+    if (fr != null) {
+        test.assertEqual(fr.ftype, FRAME_SETTINGS)
+        test.assertEqual((fr.flags & FLAG_ACK) != 0, true)
+        test.assertEqual(fr.payload.length(), 0)
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 6 settings ack — " + string(e)) }
+
+// 7 — RST_STREAM / GOAWAY / PING round-trips
+try {
+    var dec = new Http2FrameDecoder()
+    dec.push(rstStreamFrame(3, ERR_CANCEL))
+    dec.push(goawayFrame(7, ERR_NO_ERROR))
+    var opaque = Buffer.fromArray([1, 2, 3, 4, 5, 6, 7, 8])
+    dec.push(pingFrame(opaque, false))
+
+    var r: Http2Frame? = dec.next()
+    test.assertEqual(r != null, true)
+    if (r != null) {
+        test.assertEqual(r.ftype, FRAME_RST_STREAM)
+        test.assertEqual(r.streamId, 3)
+        test.assertEqual(parseRstStream(r.payload), ERR_CANCEL)
+    }
+    var g: Http2Frame? = dec.next()
+    test.assertEqual(g != null, true)
+    if (g != null) {
+        test.assertEqual(g.ftype, FRAME_GOAWAY)
+        var go = parseGoaway(g.payload)
+        test.assertEqual(go.lastStreamId, 7)
+        test.assertEqual(go.errorCode, ERR_NO_ERROR)
+    }
+    var p: Http2Frame? = dec.next()
+    test.assertEqual(p != null, true)
+    if (p != null) {
+        test.assertEqual(p.ftype, FRAME_PING)
+        test.assertEqual(p.payload.length(), 8)
+        test.assertEqual(p.payload.getByte(7), 8)
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 7 control frames — " + string(e)) }
+
+// 8 — Connection preface is the exact 24-byte magic
+try {
+    var pf = Buffer.fromString(CONNECTION_PREFACE)
+    test.assertEqual(pf.length(), 24)
+    test.assertEqual(pf.getByte(0), 0x50)  // 'P'
+    test.assertEqual(pf.getByte(1), 0x52)  // 'R'
+    test.assertEqual(pf.getByte(2), 0x49)  // 'I'
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 8 preface — " + string(e)) }
+
+print("═══════════════════════════════════════")
+print("  HTTP/2 frame layer test results")
+print("  Passed: " + string(passed))
+print("  Failed: " + string(failed))
+print("  Total:  " + string(passed + failed))
+print("═══════════════════════════════════════")

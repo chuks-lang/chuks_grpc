@@ -1,0 +1,11 @@
+{
+  "name": "@chuks/grpc",
+  "version": "0.0.1",
+  "description": "Wire-compatible gRPC for Chuks — HTTP/2 + HPACK + Protocol Buffers framing, interoperable with standard gRPC clients and servers in any language (verified against grpcurl). Pure Chuks implementation, no codegen.",
+  "main": "src/index.chuks",
+  "keywords": ["grpc", "http2", "protobuf", "hpack", "rpc", "microservices", "streaming"],
+  "author": "Chuks Team",
+  "license": "MIT",
+  "repository": "https://github.com/chuks-lang/chuks_grpc",
+  "dependencies": {}
+}

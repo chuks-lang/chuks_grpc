@@ -1,0 +1,392 @@
+// ─── chuks_grpc · Protocol Buffers wire codec ──────────────────────────────
+// Pure-Chuks implementation of the Protobuf wire format (proto3).
+// This is the binary foundation gRPC messages are built on.
+//
+// No code generation: messages are encoded/decoded field-by-field through a
+// low-level ProtoWriter / ProtoReader, or via a schema-driven dynamic Message.
+//
+// Wire format reference: https://protobuf.dev/programming-guides/encoding/
+// ───────────────────────────────────────────────────────────────────────────
+
+import { Buffer } from "std/buffer"
+
+// ─── Wire types ────────────────────────────────────────────────────────────
+
+export const PB_VARINT: int = 0   // int32/64, uint32/64, sint32/64, bool, enum
+export const PB_I64: int = 1      // fixed64, sfixed64, double
+export const PB_LEN: int = 2      // string, bytes, embedded messages, packed repeated
+export const PB_I32: int = 5      // fixed32, sfixed32, float
+
+// ─── Bit helpers ───────────────────────────────────────────────────────────
+// Chuks `int` is a signed 64-bit value (>> is arithmetic). Varint/zigzag math
+// needs logical (unsigned) shifts in a few places, emulated here by masking.
+
+// Logical shift-right by 7 of a 64-bit value.
+function lshr7(v: int): int {
+    return (v >> 7) & 0x01FFFFFFFFFFFFFF
+}
+
+// Logical shift-right by 1 of a 64-bit value.
+function lshr1(v: int): int {
+    return (v >> 1) & 0x7FFFFFFFFFFFFFFF
+}
+
+// ZigZag encode (sint): maps signed → unsigned so small magnitudes stay small.
+export function zigzagEncode(n: int): int {
+    return (n << 1) ^ (n >> 63)
+}
+
+// ZigZag decode.
+export function zigzagDecode(n: int): int {
+    return lshr1(n) ^ (-(n & 1))
+}
+
+// ─── A decoded tag (field number + wire type) ──────────────────────────────
+
+export dataType ProtoTag {
+    field: int;
+    wireType: int;
+}
+
+// ─── ProtoWriter ───────────────────────────────────────────────────────────
+// Accumulates bytes for a single message. Fixed-width values are written
+// little-endian (protobuf wire order), independent of Buffer's big-endian API.
+
+export class ProtoWriter {
+    var _bytes: []int
+
+    constructor() {
+        this._bytes = []
+    }
+
+    private putByte(b: int): void {
+        this._bytes.push(b & 0xFF)
+    }
+
+    // Base-128 varint (LEB128). Negative ints emit the full 10 bytes, matching
+    // protobuf's int32/int64 sign-extension semantics.
+    public writeVarint(value: int): void {
+        var v: int = value
+        while (true) {
+            var b: int = v & 0x7F
+            v = lshr7(v)
+            if (v != 0) {
+                this.putByte(b | 0x80)
+            } else {
+                this.putByte(b)
+                break
+            }
+        }
+    }
+
+    public writeTag(field: int, wireType: int): void {
+        this.writeVarint((field << 3) | wireType)
+    }
+
+    private putFixed32(v: int): void {
+        this.putByte(v & 0xFF)
+        this.putByte((v >> 8) & 0xFF)
+        this.putByte((v >> 16) & 0xFF)
+        this.putByte((v >> 24) & 0xFF)
+    }
+
+    private putFixed64(v: int): void {
+        this.putByte(v & 0xFF)
+        this.putByte((v >> 8) & 0xFF)
+        this.putByte((v >> 16) & 0xFF)
+        this.putByte((v >> 24) & 0xFF)
+        this.putByte((v >> 32) & 0xFF)
+        this.putByte((v >> 40) & 0xFF)
+        this.putByte((v >> 48) & 0xFF)
+        this.putByte((v >> 56) & 0xFF)
+    }
+
+    // ── Scalar field writers ───────────────────────────────────────────────
+
+    public writeInt32(field: int, v: int): void {
+        this.writeTag(field, PB_VARINT)
+        this.writeVarint(v)
+    }
+
+    public writeInt64(field: int, v: int): void {
+        this.writeTag(field, PB_VARINT)
+        this.writeVarint(v)
+    }
+
+    public writeUInt(field: int, v: int): void {
+        this.writeTag(field, PB_VARINT)
+        this.writeVarint(v)
+    }
+
+    public writeSInt(field: int, v: int): void {
+        this.writeTag(field, PB_VARINT)
+        this.writeVarint(zigzagEncode(v))
+    }
+
+    public writeBool(field: int, v: bool): void {
+        this.writeTag(field, PB_VARINT)
+        if (v) {
+            this.writeVarint(1)
+        } else {
+            this.writeVarint(0)
+        }
+    }
+
+    public writeEnum(field: int, v: int): void {
+        this.writeTag(field, PB_VARINT)
+        this.writeVarint(v)
+    }
+
+    public writeFixed32(field: int, v: int): void {
+        this.writeTag(field, PB_I32)
+        this.putFixed32(v)
+    }
+
+    public writeFixed64(field: int, v: int): void {
+        this.writeTag(field, PB_I64)
+        this.putFixed64(v)
+    }
+
+    public writeFloat(field: int, v: float): void {
+        this.writeTag(field, PB_I32)
+        var tmp = new Buffer(4)
+        tmp.writeFloat32BE(v)
+        // Reverse big-endian bytes to little-endian.
+        this.putByte(tmp.getByte(3))
+        this.putByte(tmp.getByte(2))
+        this.putByte(tmp.getByte(1))
+        this.putByte(tmp.getByte(0))
+    }
+
+    public writeDouble(field: int, v: float): void {
+        this.writeTag(field, PB_I64)
+        var tmp = new Buffer(8)
+        tmp.writeFloat64BE(v)
+        var i: int = 7
+        while (i >= 0) {
+            this.putByte(tmp.getByte(i))
+            i = i - 1
+        }
+    }
+
+    public writeString(field: int, s: string): void {
+        this.writeTag(field, PB_LEN)
+        var sb = Buffer.fromString(s)
+        var n: int = sb.length()
+        this.writeVarint(n)
+        var i: int = 0
+        while (i < n) {
+            this.putByte(sb.getByte(i))
+            i = i + 1
+        }
+    }
+
+    public writeBytes(field: int, data: Buffer): void {
+        this.writeTag(field, PB_LEN)
+        var n: int = data.length()
+        this.writeVarint(n)
+        var i: int = 0
+        while (i < n) {
+            this.putByte(data.getByte(i))
+            i = i + 1
+        }
+    }
+
+    // Embed a nested message (length-delimited).
+    public writeMessage(field: int, sub: ProtoWriter): void {
+        this.writeTag(field, PB_LEN)
+        var raw: []int = sub.toByteArray()
+        this.writeVarint(raw.length)
+        var i: int = 0
+        while (i < raw.length) {
+            this.putByte(raw[i])
+            i = i + 1
+        }
+    }
+
+    // Append raw, already-encoded bytes (e.g. a serialized sub-message).
+    public writeRaw(data: Buffer): void {
+        var n: int = data.length()
+        var i: int = 0
+        while (i < n) {
+            this.putByte(data.getByte(i))
+            i = i + 1
+        }
+    }
+
+    // ── Output ─────────────────────────────────────────────────────────────
+
+    public toByteArray(): []int {
+        return this._bytes
+    }
+
+    public toBuffer(): Buffer {
+        var arr: []any = []
+        var i: int = 0
+        while (i < this._bytes.length) {
+            arr.push(this._bytes[i])
+            i = i + 1
+        }
+        return Buffer.fromArray(arr)
+    }
+
+    public length(): int {
+        return this._bytes.length
+    }
+}
+
+// ─── ProtoReader ───────────────────────────────────────────────────────────
+
+export class ProtoReader {
+    var _bytes: []int
+    var _pos: int
+    var _len: int
+
+    constructor(buf: Buffer) {
+        this._bytes = buf.toArray()
+        this._pos = 0
+        this._len = buf.length()
+    }
+
+    public hasMore(): bool {
+        return this._pos < this._len
+    }
+
+    public position(): int {
+        return this._pos
+    }
+
+    private getByte(): int {
+        var b: int = this._bytes[this._pos]
+        this._pos = this._pos + 1
+        return b
+    }
+
+    public readVarint(): int {
+        var result: int = 0
+        var shift: int = 0
+        while (true) {
+            var b: int = this.getByte()
+            result = result | ((b & 0x7F) << shift)
+            if ((b & 0x80) == 0) {
+                break
+            }
+            shift = shift + 7
+        }
+        return result
+    }
+
+    public readTag(): ProtoTag {
+        var t: int = this.readVarint()
+        var tag: ProtoTag = { field: t >> 3, wireType: t & 0x07 }
+        return tag
+    }
+
+    public readInt(): int {
+        return this.readVarint()
+    }
+
+    public readSInt(): int {
+        return zigzagDecode(this.readVarint())
+    }
+
+    public readBool(): bool {
+        return this.readVarint() != 0
+    }
+
+    private readFixed32Raw(): int {
+        var b0: int = this.getByte()
+        var b1: int = this.getByte()
+        var b2: int = this.getByte()
+        var b3: int = this.getByte()
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    private readFixed64Raw(): int {
+        var b0: int = this.getByte()
+        var b1: int = this.getByte()
+        var b2: int = this.getByte()
+        var b3: int = this.getByte()
+        var b4: int = this.getByte()
+        var b5: int = this.getByte()
+        var b6: int = this.getByte()
+        var b7: int = this.getByte()
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+    }
+
+    public readFixed32(): int {
+        return this.readFixed32Raw()
+    }
+
+    public readFixed64(): int {
+        return this.readFixed64Raw()
+    }
+
+    public readFloat(): float {
+        var b0: int = this.getByte()
+        var b1: int = this.getByte()
+        var b2: int = this.getByte()
+        var b3: int = this.getByte()
+        var tmp = new Buffer(4)
+        tmp.setByte(0, b3)
+        tmp.setByte(1, b2)
+        tmp.setByte(2, b1)
+        tmp.setByte(3, b0)
+        tmp.seek(0)
+        return tmp.readFloat32BE()
+    }
+
+    public readDouble(): float {
+        var tmp = new Buffer(8)
+        var i: int = 7
+        while (i >= 0) {
+            tmp.setByte(i, this.getByte())
+            i = i - 1
+        }
+        tmp.seek(0)
+        return tmp.readFloat64BE()
+    }
+
+    public readString(): string {
+        var n: int = this.readVarint()
+        var arr: []any = []
+        var i: int = 0
+        while (i < n) {
+            arr.push(this.getByte())
+            i = i + 1
+        }
+        var b = Buffer.fromArray(arr)
+        return b.toStringUtf8()
+    }
+
+    public readBytes(): Buffer {
+        var n: int = this.readVarint()
+        var arr: []any = []
+        var i: int = 0
+        while (i < n) {
+            arr.push(this.getByte())
+            i = i + 1
+        }
+        return Buffer.fromArray(arr)
+    }
+
+    // Read a length-delimited sub-message as its own reader.
+    public readMessage(): ProtoReader {
+        var sub: Buffer = this.readBytes()
+        return new ProtoReader(sub)
+    }
+
+    // Skip a field's value given its wire type (for unknown fields).
+    public skip(wireType: int): void {
+        if (wireType == PB_VARINT) {
+            this.readVarint()
+        } else if (wireType == PB_I64) {
+            this._pos = this._pos + 8
+        } else if (wireType == PB_LEN) {
+            var n: int = this.readVarint()
+            this._pos = this._pos + n
+        } else if (wireType == PB_I32) {
+            this._pos = this._pos + 4
+        }
+    }
+}

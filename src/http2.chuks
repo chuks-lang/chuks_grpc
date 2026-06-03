@@ -1,0 +1,276 @@
+// ─── chuks_grpc · HTTP/2 frame layer (RFC 7540) ────────────────────────────
+// Pure framing: the 24-byte client preface, the 9-byte frame header, and
+// encode/decode for every frame type gRPC uses. No I/O here — this module is
+// driven by the server/client in index.chuks over a TcpConnection.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { Buffer } from "std/buffer"
+
+// Client connection preface (RFC 7540 §3.5). Sent by the client immediately
+// after the TCP/TLS connection is established, before any frames.
+export const CONNECTION_PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+// Frame types (RFC 7540 §6)
+export const FRAME_DATA: int = 0x0
+export const FRAME_HEADERS: int = 0x1
+export const FRAME_PRIORITY: int = 0x2
+export const FRAME_RST_STREAM: int = 0x3
+export const FRAME_SETTINGS: int = 0x4
+export const FRAME_PUSH_PROMISE: int = 0x5
+export const FRAME_PING: int = 0x6
+export const FRAME_GOAWAY: int = 0x7
+export const FRAME_WINDOW_UPDATE: int = 0x8
+export const FRAME_CONTINUATION: int = 0x9
+
+// Frame flags (meaning depends on frame type)
+export const FLAG_END_STREAM: int = 0x1
+export const FLAG_ACK: int = 0x1
+export const FLAG_END_HEADERS: int = 0x4
+export const FLAG_PADDED: int = 0x8
+export const FLAG_PRIORITY: int = 0x20
+
+// SETTINGS parameter identifiers (RFC 7540 §6.5.2)
+export const SETTINGS_HEADER_TABLE_SIZE: int = 0x1
+export const SETTINGS_ENABLE_PUSH: int = 0x2
+export const SETTINGS_MAX_CONCURRENT_STREAMS: int = 0x3
+export const SETTINGS_INITIAL_WINDOW_SIZE: int = 0x4
+export const SETTINGS_MAX_FRAME_SIZE: int = 0x5
+export const SETTINGS_MAX_HEADER_LIST_SIZE: int = 0x6
+
+// Error codes (RFC 7540 §7)
+export const ERR_NO_ERROR: int = 0x0
+export const ERR_PROTOCOL_ERROR: int = 0x1
+export const ERR_INTERNAL_ERROR: int = 0x2
+export const ERR_FLOW_CONTROL_ERROR: int = 0x3
+export const ERR_STREAM_CLOSED: int = 0x5
+export const ERR_FRAME_SIZE_ERROR: int = 0x6
+export const ERR_REFUSED_STREAM: int = 0x7
+export const ERR_CANCEL: int = 0x8
+
+export const DEFAULT_MAX_FRAME_SIZE: int = 16384
+
+// ─── Types ─────────────────────────────────────────────────────────────────
+
+export dataType Http2Frame {
+    ftype: int;
+    flags: int;
+    streamId: int;
+    payload: Buffer;
+}
+
+export dataType Http2Setting {
+    id: int;
+    value: int;
+}
+
+export dataType Http2Goaway {
+    lastStreamId: int;
+    errorCode: int;
+}
+
+function emptyBuffer(): Buffer {
+    var none: []any = []
+    return Buffer.fromArray(none)
+}
+
+// ─── Frame encoding ────────────────────────────────────────────────────────
+
+// Build a raw frame: 9-byte header + payload. The reserved bit of the stream
+// id is always cleared.
+export function encodeFrame(ftype: int, flags: int, streamId: int, payload: Buffer): Buffer {
+    var len: int = payload.length()
+    if (len > 0xFFFFFF) {
+        throw "http2: frame payload too large"
+    }
+    var hdr: []any = []
+    hdr.push((len >> 16) & 0xFF)
+    hdr.push((len >> 8) & 0xFF)
+    hdr.push(len & 0xFF)
+    hdr.push(ftype & 0xFF)
+    hdr.push(flags & 0xFF)
+    hdr.push((streamId >> 24) & 0x7F)
+    hdr.push((streamId >> 16) & 0xFF)
+    hdr.push((streamId >> 8) & 0xFF)
+    hdr.push(streamId & 0xFF)
+    var headerBuf: Buffer = Buffer.fromArray(hdr)
+    var parts: []Buffer = [headerBuf, payload]
+    return Buffer.concat(parts)
+}
+
+// DATA frame carrying a gRPC-framed message (or part of one).
+export function dataFrame(streamId: int, data: Buffer, endStream: bool): Buffer {
+    var flags: int = 0
+    if (endStream) {
+        flags = flags | FLAG_END_STREAM
+    }
+    return encodeFrame(FRAME_DATA, flags, streamId, data)
+}
+
+// HEADERS frame carrying an HPACK header block. (No padding / priority.)
+export function headersFrame(streamId: int, block: Buffer, endStream: bool, endHeaders: bool): Buffer {
+    var flags: int = 0
+    if (endStream) {
+        flags = flags | FLAG_END_STREAM
+    }
+    if (endHeaders) {
+        flags = flags | FLAG_END_HEADERS
+    }
+    return encodeFrame(FRAME_HEADERS, flags, streamId, block)
+}
+
+// SETTINGS frame. If ack is true, an empty ACK frame is produced.
+export function settingsFrame(settings: []Http2Setting, ack: bool): Buffer {
+    if (ack) {
+        return encodeFrame(FRAME_SETTINGS, FLAG_ACK, 0, emptyBuffer())
+    }
+    var bytes: []any = []
+    var i: int = 0
+    while (i < settings.length) {
+        var s: Http2Setting = settings[i]
+        bytes.push((s.id >> 8) & 0xFF)
+        bytes.push(s.id & 0xFF)
+        bytes.push((s.value >> 24) & 0xFF)
+        bytes.push((s.value >> 16) & 0xFF)
+        bytes.push((s.value >> 8) & 0xFF)
+        bytes.push(s.value & 0xFF)
+        i = i + 1
+    }
+    return encodeFrame(FRAME_SETTINGS, 0, 0, Buffer.fromArray(bytes))
+}
+
+// WINDOW_UPDATE frame (connection-level if streamId == 0).
+export function windowUpdateFrame(streamId: int, increment: int): Buffer {
+    var bytes: []any = []
+    bytes.push((increment >> 24) & 0x7F)
+    bytes.push((increment >> 16) & 0xFF)
+    bytes.push((increment >> 8) & 0xFF)
+    bytes.push(increment & 0xFF)
+    return encodeFrame(FRAME_WINDOW_UPDATE, 0, streamId, Buffer.fromArray(bytes))
+}
+
+// RST_STREAM frame.
+export function rstStreamFrame(streamId: int, errorCode: int): Buffer {
+    var bytes: []any = []
+    bytes.push((errorCode >> 24) & 0xFF)
+    bytes.push((errorCode >> 16) & 0xFF)
+    bytes.push((errorCode >> 8) & 0xFF)
+    bytes.push(errorCode & 0xFF)
+    return encodeFrame(FRAME_RST_STREAM, 0, streamId, Buffer.fromArray(bytes))
+}
+
+// GOAWAY frame (no debug data).
+export function goawayFrame(lastStreamId: int, errorCode: int): Buffer {
+    var bytes: []any = []
+    bytes.push((lastStreamId >> 24) & 0x7F)
+    bytes.push((lastStreamId >> 16) & 0xFF)
+    bytes.push((lastStreamId >> 8) & 0xFF)
+    bytes.push(lastStreamId & 0xFF)
+    bytes.push((errorCode >> 24) & 0xFF)
+    bytes.push((errorCode >> 16) & 0xFF)
+    bytes.push((errorCode >> 8) & 0xFF)
+    bytes.push(errorCode & 0xFF)
+    return encodeFrame(FRAME_GOAWAY, 0, 0, Buffer.fromArray(bytes))
+}
+
+// PING frame. `opaque` must be exactly 8 bytes.
+export function pingFrame(opaque: Buffer, ack: bool): Buffer {
+    var flags: int = 0
+    if (ack) {
+        flags = FLAG_ACK
+    }
+    return encodeFrame(FRAME_PING, flags, 0, opaque)
+}
+
+// ─── Payload parsing ───────────────────────────────────────────────────────
+
+export function parseSettings(payload: Buffer): []Http2Setting {
+    var out: []Http2Setting = []
+    var n: int = payload.length()
+    if (n % 6 != 0) {
+        throw "http2: malformed SETTINGS payload"
+    }
+    var i: int = 0
+    while (i < n) {
+        var id: int = (payload.getByte(i) << 8) | payload.getByte(i + 1)
+        var value: int = (payload.getByte(i + 2) << 24) | (payload.getByte(i + 3) << 16) | (payload.getByte(i + 4) << 8) | payload.getByte(i + 5)
+        var s: Http2Setting = { id: id, value: value }
+        out.push(s)
+        i = i + 6
+    }
+    return out
+}
+
+export function parseWindowUpdate(payload: Buffer): int {
+    return ((payload.getByte(0) & 0x7F) << 24) | (payload.getByte(1) << 16) | (payload.getByte(2) << 8) | payload.getByte(3)
+}
+
+export function parseRstStream(payload: Buffer): int {
+    return (payload.getByte(0) << 24) | (payload.getByte(1) << 16) | (payload.getByte(2) << 8) | payload.getByte(3)
+}
+
+export function parseGoaway(payload: Buffer): Http2Goaway {
+    var lastId: int = ((payload.getByte(0) & 0x7F) << 24) | (payload.getByte(1) << 16) | (payload.getByte(2) << 8) | payload.getByte(3)
+    var err: int = (payload.getByte(4) << 24) | (payload.getByte(5) << 16) | (payload.getByte(6) << 8) | payload.getByte(7)
+    var g: Http2Goaway = { lastStreamId: lastId, errorCode: err }
+    return g
+}
+
+// ─── Incremental frame decoder ─────────────────────────────────────────────
+// Feed raw bytes from the socket via push(); pull complete frames via next().
+// Returns null when not enough bytes have arrived for the next whole frame.
+
+export class Http2FrameDecoder {
+    var _pending: []int
+
+    constructor() {
+        this._pending = []
+    }
+
+    public push(data: Buffer): void {
+        var arr: []int = data.toArray()
+        var i: int = 0
+        while (i < arr.length) {
+            this._pending.push(arr[i])
+            i = i + 1
+        }
+    }
+
+    public buffered(): int {
+        return this._pending.length
+    }
+
+    public next(): Http2Frame? {
+        var none: Http2Frame? = null
+        if (this._pending.length < 9) {
+            return none
+        }
+        var len: int = (this._pending[0] << 16) | (this._pending[1] << 8) | this._pending[2]
+        var total: int = 9 + len
+        if (this._pending.length < total) {
+            return none
+        }
+        var ftype: int = this._pending[3]
+        var flags: int = this._pending[4]
+        var streamId: int = ((this._pending[5] & 0x7F) << 24) | (this._pending[6] << 16) | (this._pending[7] << 8) | this._pending[8]
+
+        var payloadArr: []any = []
+        var i: int = 9
+        while (i < total) {
+            payloadArr.push(this._pending[i])
+            i = i + 1
+        }
+        var payload: Buffer = Buffer.fromArray(payloadArr)
+
+        // Drop consumed bytes from the pending buffer.
+        var rest: []int = []
+        var j: int = total
+        while (j < this._pending.length) {
+            rest.push(this._pending[j])
+            j = j + 1
+        }
+        this._pending = rest
+
+        var frame: Http2Frame = { ftype: ftype, flags: flags, streamId: streamId, payload: payload }
+        return frame
+    }
+}

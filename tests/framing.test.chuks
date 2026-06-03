@@ -1,0 +1,103 @@
+// ─── chuks_grpc · gRPC framing tests ───────────────────────────────────────
+
+import { test } from "std/test"
+import { Buffer } from "std/buffer"
+import { encodeMessage, frameMessage, GrpcFrameDecoder, GrpcMessage } from "../src/framing.chuks"
+
+var passed: any = 0
+var failed: any = 0
+
+// 1 — encode produces 1 flag byte + 4 BE length + body
+try {
+    var msg = Buffer.fromArray([1, 2, 3])
+    var framed = frameMessage(msg)
+    test.assertEqual(framed.toString("hex"), "0000000003010203")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 1 encode — " + string(e)) }
+
+// 2 — compressed flag set
+try {
+    var msg = Buffer.fromArray([255])
+    var framed = encodeMessage(msg, true)
+    test.assertEqual(framed.toString("hex"), "0100000001ff")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 2 compressed — " + string(e)) }
+
+// 3 — empty message frames to a 5-byte header
+try {
+    var framed = frameMessage(Buffer.fromArray([]))
+    test.assertEqual(framed.toString("hex"), "0000000000")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 3 empty — " + string(e)) }
+
+// 4 — decode a single full frame
+try {
+    var dec = new GrpcFrameDecoder()
+    dec.push(frameMessage(Buffer.fromArray([10, 20, 30])))
+    var m: GrpcMessage? = dec.next()
+    test.assert(m != null)
+    if (m != null) {
+        test.assertEqual(m.compressed, false)
+        test.assertEqual(m.data.toString("hex"), "0a141e")
+    }
+    test.assert(dec.next() == null)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 4 decode single — " + string(e)) }
+
+// 5 — two messages coalesced in one push
+try {
+    var a = frameMessage(Buffer.fromArray([1]))
+    var b = frameMessage(Buffer.fromArray([2, 2]))
+    var dec = new GrpcFrameDecoder()
+    dec.push(Buffer.concat([a, b]))
+    var m1: GrpcMessage? = dec.next()
+    var m2: GrpcMessage? = dec.next()
+    test.assert(m1 != null)
+    test.assert(m2 != null)
+    if (m1 != null) { test.assertEqual(m1.data.toString("hex"), "01") }
+    if (m2 != null) { test.assertEqual(m2.data.toString("hex"), "0202") }
+    test.assert(dec.next() == null)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 5 coalesced — " + string(e)) }
+
+// 6 — message split across multiple pushes (partial header, then body)
+try {
+    var framed = frameMessage(Buffer.fromArray([9, 8, 7, 6]))
+    var dec = new GrpcFrameDecoder()
+    // feed 3 bytes (incomplete header) → nothing yet
+    dec.push(framed.slice(0, 3))
+    test.assert(dec.next() == null)
+    // feed up to byte 6 (header complete, body incomplete) → still nothing
+    dec.push(framed.slice(3, 7))
+    test.assert(dec.next() == null)
+    // feed the rest
+    dec.push(framed.slice(7, framed.length()))
+    var m: GrpcMessage? = dec.next()
+    test.assert(m != null)
+    if (m != null) { test.assertEqual(m.data.toString("hex"), "09080706") }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 6 split — " + string(e)) }
+
+// 7 — larger message (length needs more than one byte)
+try {
+    var big: []any = []
+    var i: int = 0
+    while (i < 300) { big.push(i & 0xFF); i = i + 1 }
+    var payload = Buffer.fromArray(big)
+    var dec = new GrpcFrameDecoder()
+    dec.push(frameMessage(payload))
+    var m: GrpcMessage? = dec.next()
+    test.assert(m != null)
+    if (m != null) {
+        test.assertEqual(m.data.length(), 300)
+        test.assertEqual(m.data.equals(payload), true)
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 7 large — " + string(e)) }
+
+print("═══════════════════════════════════════")
+print("  gRPC framing test results")
+print("  Passed: " + string(passed))
+print("  Failed: " + string(failed))
+print("  Total:  " + string(passed + failed))
+print("═══════════════════════════════════════")

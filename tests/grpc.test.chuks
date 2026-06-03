@@ -1,0 +1,122 @@
+// ─── chuks_grpc · end-to-end gRPC (h2c) round-trip tests ───────────────────
+// Spins up a real in-process gRPC server on an ephemeral port and drives it
+// with the gRPC client over a live TCP/HTTP-2 connection.
+
+import { test } from "std/test"
+import { Buffer } from "std/buffer"
+import {
+    GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
+    grpcOk,
+    STATUS_OK, STATUS_UNIMPLEMENTED
+} from "../src/index.chuks"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
+
+var passed: any = 0
+var failed: any = 0
+
+// Parse the port out of a "host:port" address string.
+function portOf(addr: string): int {
+    var b: Buffer = Buffer.fromString(addr)
+    var n: int = b.length()
+    var colon: int = -1
+    var i: int = 0
+    while (i < n) {
+        if (b.getByte(i) == 58) { colon = i }   // ':'
+        i = i + 1
+    }
+    var val: int = 0
+    var j: int = colon + 1
+    while (j < n) {
+        var c: int = b.getByte(j)
+        if (c >= 48 && c <= 57) { val = val * 10 + (c - 48) }
+        j = j + 1
+    }
+    return val
+}
+
+// Encode a protobuf message { field 1: string }.
+function encodeName(name: string): Buffer {
+    var w: ProtoWriter = new ProtoWriter()
+    w.writeString(1, name)
+    return w.toBuffer()
+}
+
+// Decode field 1 (string) from a protobuf message.
+function decodeName(data: Buffer): string {
+    var r: ProtoReader = new ProtoReader(data)
+    var out: string = ""
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 1 && tag.wireType == PB_LEN) {
+            out = r.readString()
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return out
+}
+
+// Handler: Echo.Say(name) -> "hello, " + name
+function sayHandler(req: GrpcRequest): GrpcResponse {
+    var name: string = decodeName(req.data)
+    return grpcOk(encodeName("hello, " + name))
+}
+
+// Run a single connection's worth of serving on a background task.
+async function runServer(srv: GrpcServer): Task<void> {
+    srv.serveOnce()
+}
+
+// 1 — unary round-trip echo
+try {
+    var srv: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv.register("/echo.Echo/Say", sayHandler)
+    var port: int = portOf(srv.addr())
+    var t: Task<void> = spawn runServer(srv)
+
+    var client: GrpcClient = new GrpcClient("127.0.0.1", port)
+    var reply: GrpcReply = client.unary("/echo.Echo/Say", encodeName("world"))
+    test.assertEqual(reply.status, STATUS_OK)
+    test.assertEqual(decodeName(reply.data), "hello, world")
+    client.close()
+    await t
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 1 unary echo — " + string(e)) }
+
+// 2 — unknown method -> UNIMPLEMENTED trailers-only response
+try {
+    var srv2: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv2.register("/echo.Echo/Say", sayHandler)
+    var port2: int = portOf(srv2.addr())
+    var t2: Task<void> = spawn runServer(srv2)
+
+    var client2: GrpcClient = new GrpcClient("127.0.0.1", port2)
+    var reply2: GrpcReply = client2.unary("/echo.Echo/Missing", encodeName("x"))
+    test.assertEqual(reply2.status, STATUS_UNIMPLEMENTED)
+    client2.close()
+    await t2
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 2 unimplemented — " + string(e)) }
+
+// 3 — empty request message round-trips
+try {
+    var srv3: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv3.register("/echo.Echo/Say", sayHandler)
+    var port3: int = portOf(srv3.addr())
+    var t3: Task<void> = spawn runServer(srv3)
+
+    var client3: GrpcClient = new GrpcClient("127.0.0.1", port3)
+    var reply3: GrpcReply = client3.unary("/echo.Echo/Say", encodeName(""))
+    test.assertEqual(reply3.status, STATUS_OK)
+    test.assertEqual(decodeName(reply3.data), "hello, ")
+    client3.close()
+    await t3
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 3 empty message — " + string(e)) }
+
+print("═══════════════════════════════════════")
+print("  gRPC h2c round-trip test results")
+print("  Passed: " + string(passed))
+print("  Failed: " + string(failed))
+print("  Total:  " + string(passed + failed))
+print("═══════════════════════════════════════")

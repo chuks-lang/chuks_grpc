@@ -1,0 +1,44 @@
+// Standalone gRPC echo server for external interop testing.
+// Listens on 127.0.0.1:50151 and serves the Echo.Say unary method.
+//
+//   chuks run examples/echo_server.chuks
+//   grpcurl -plaintext -proto examples/echo.proto \
+//       -d '{"name":"world"}' 127.0.0.1:50151 echo.Echo/Say
+
+import { Buffer } from "std/buffer"
+import { GrpcServer, GrpcRequest, GrpcResponse, grpcOk } from "../src/index.chuks"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
+
+// EchoRequest  { string name  = 1; }
+// EchoResponse { string reply = 1; }
+
+function decodeName(data: Buffer): string {
+    var r: ProtoReader = new ProtoReader(data)
+    var out: string = ""
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 1 && tag.wireType == PB_LEN) {
+            out = r.readString()
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return out
+}
+
+function encodeReply(reply: string): Buffer {
+    var w: ProtoWriter = new ProtoWriter()
+    w.writeString(1, reply)
+    return w.toBuffer()
+}
+
+function sayHandler(req: GrpcRequest): GrpcResponse {
+    var name: string = decodeName(req.data)
+    println("→ Echo.Say(name=\"" + name + "\")")
+    return grpcOk(encodeReply("hello, " + name))
+}
+
+var srv: GrpcServer = new GrpcServer("127.0.0.1", 50151)
+srv.register("/echo.Echo/Say", sayHandler)
+println("gRPC echo server listening on " + srv.addr())
+srv.serve()

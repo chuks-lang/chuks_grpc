@@ -1,0 +1,235 @@
+// ─── chuks_grpc · Protobuf wire codec tests ────────────────────────────────
+// Golden vectors taken from the Protocol Buffers encoding spec, plus
+// round-trip checks. Validates true wire compatibility byte-for-byte.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { test } from "std/test"
+import { Buffer } from "std/buffer"
+import {
+    ProtoWriter,
+    ProtoReader,
+    ProtoTag,
+    zigzagEncode,
+    zigzagDecode,
+    PB_VARINT,
+    PB_LEN,
+    PB_I32,
+    PB_I64
+} from "../src/protobuf.chuks"
+
+var passed: any = 0
+var failed: any = 0
+
+function hexOf(w: ProtoWriter): string {
+    return w.toBuffer().toString("hex")
+}
+
+// 1 — canonical: field 1 (int32) = 150  →  08 96 01
+try {
+    var w = new ProtoWriter()
+    w.writeInt32(1, 150)
+    test.assertEqual(hexOf(w), "089601")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 1 int32=150 — " + string(e)) }
+
+// 2 — field 2 (string) = "testing"  →  12 07 74 65 73 74 69 6e 67
+try {
+    var w = new ProtoWriter()
+    w.writeString(2, "testing")
+    test.assertEqual(hexOf(w), "120774657374696e67")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 2 string — " + string(e)) }
+
+// 3 — sint32 field 1 = -1  →  zigzag(−1)=1  →  08 01
+try {
+    var w = new ProtoWriter()
+    w.writeSInt(1, -1)
+    test.assertEqual(hexOf(w), "0801")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 3 sint=-1 — " + string(e)) }
+
+// 4 — sint32 field 1 = 1  →  zigzag(1)=2  →  08 02
+try {
+    var w = new ProtoWriter()
+    w.writeSInt(1, 1)
+    test.assertEqual(hexOf(w), "0802")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 4 sint=1 — " + string(e)) }
+
+// 5 — fixed32 field 5 = 1  →  tag 0x2d, 01 00 00 00
+try {
+    var w = new ProtoWriter()
+    w.writeFixed32(5, 1)
+    test.assertEqual(hexOf(w), "2d01000000")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 5 fixed32 — " + string(e)) }
+
+// 6 — double field 1 = 1.0  →  09 00 00 00 00 00 00 f0 3f
+try {
+    var w = new ProtoWriter()
+    w.writeDouble(1, 1.0)
+    test.assertEqual(hexOf(w), "09000000000000f03f")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 6 double=1.0 — " + string(e)) }
+
+// 7 — bool field 3 = true  →  18 01
+try {
+    var w = new ProtoWriter()
+    w.writeBool(3, true)
+    test.assertEqual(hexOf(w), "1801")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 7 bool — " + string(e)) }
+
+// 8 — int32 field 1 = -1  →  08 + 10-byte varint  (ff*9 01)
+try {
+    var w = new ProtoWriter()
+    w.writeInt32(1, -1)
+    test.assertEqual(hexOf(w), "08ffffffffffffffffff01")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 8 int32=-1 — " + string(e)) }
+
+// 9 — float field 1 = 1.5  →  tag 0x0d, 00 00 c0 3f
+try {
+    var w = new ProtoWriter()
+    w.writeFloat(1, 1.5)
+    test.assertEqual(hexOf(w), "0d0000c03f")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 9 float=1.5 — " + string(e)) }
+
+// 10 — fixed64 field 2 = 1  →  tag 0x11, 01 00 00 00 00 00 00 00
+try {
+    var w = new ProtoWriter()
+    w.writeFixed64(2, 1)
+    test.assertEqual(hexOf(w), "110100000000000000")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 10 fixed64 — " + string(e)) }
+
+// 11 — varint 300 as int32 field 1  →  08 ac 02
+try {
+    var w = new ProtoWriter()
+    w.writeInt32(1, 300)
+    test.assertEqual(hexOf(w), "08ac02")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 11 varint=300 — " + string(e)) }
+
+// 12 — zigzag helpers
+try {
+    test.assertEqual(zigzagEncode(0), 0)
+    test.assertEqual(zigzagEncode(-1), 1)
+    test.assertEqual(zigzagEncode(1), 2)
+    test.assertEqual(zigzagEncode(-2), 3)
+    test.assertEqual(zigzagEncode(2147483647), 4294967294)
+    test.assertEqual(zigzagDecode(zigzagEncode(-123456789)), -123456789)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 12 zigzag — " + string(e)) }
+
+// 13 — round-trip a mixed message
+try {
+    var w = new ProtoWriter()
+    w.writeInt32(1, 42)
+    w.writeString(2, "hello")
+    w.writeBool(3, true)
+    w.writeSInt(4, -50)
+    w.writeDouble(5, 3.14159)
+    w.writeFixed32(6, 123456)
+
+    var r = new ProtoReader(w.toBuffer())
+
+    var t1: ProtoTag = r.readTag()
+    test.assertEqual(t1.field, 1)
+    test.assertEqual(t1.wireType, PB_VARINT)
+    test.assertEqual(r.readInt(), 42)
+
+    var t2: ProtoTag = r.readTag()
+    test.assertEqual(t2.field, 2)
+    test.assertEqual(t2.wireType, PB_LEN)
+    test.assertEqual(r.readString(), "hello")
+
+    var t3: ProtoTag = r.readTag()
+    test.assertEqual(t3.field, 3)
+    test.assertEqual(r.readBool(), true)
+
+    var t4: ProtoTag = r.readTag()
+    test.assertEqual(t4.field, 4)
+    test.assertEqual(r.readSInt(), -50)
+
+    var t5: ProtoTag = r.readTag()
+    test.assertEqual(t5.field, 5)
+    test.assertEqual(t5.wireType, PB_I64)
+    test.assertEqual(r.readDouble(), 3.14159)
+
+    var t6: ProtoTag = r.readTag()
+    test.assertEqual(t6.field, 6)
+    test.assertEqual(t6.wireType, PB_I32)
+    test.assertEqual(r.readFixed32(), 123456)
+
+    test.assertEqual(r.hasMore(), false)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 13 round-trip — " + string(e)) }
+
+// 14 — nested message round-trip
+try {
+    var inner = new ProtoWriter()
+    inner.writeInt32(1, 7)
+    inner.writeString(2, "nested")
+
+    var outer = new ProtoWriter()
+    outer.writeString(1, "outer")
+    outer.writeMessage(2, inner)
+
+    var r = new ProtoReader(outer.toBuffer())
+    var ta: ProtoTag = r.readTag()
+    test.assertEqual(ta.field, 1)
+    test.assertEqual(r.readString(), "outer")
+
+    var tb: ProtoTag = r.readTag()
+    test.assertEqual(tb.field, 2)
+    test.assertEqual(tb.wireType, PB_LEN)
+    var sub: ProtoReader = r.readMessage()
+    var s1: ProtoTag = sub.readTag()
+    test.assertEqual(s1.field, 1)
+    test.assertEqual(sub.readInt(), 7)
+    var s2: ProtoTag = sub.readTag()
+    test.assertEqual(sub.readString(), "nested")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 14 nested — " + string(e)) }
+
+// 15 — skip unknown fields
+try {
+    var w = new ProtoWriter()
+    w.writeInt32(1, 99)
+    w.writeString(2, "skipme")
+    w.writeFixed64(3, 888)
+    w.writeBool(4, true)
+
+    var r = new ProtoReader(w.toBuffer())
+    // read field 1
+    r.readTag(); test.assertEqual(r.readInt(), 99)
+    // skip field 2 (LEN) and field 3 (I64)
+    var t2: ProtoTag = r.readTag(); r.skip(t2.wireType)
+    var t3: ProtoTag = r.readTag(); r.skip(t3.wireType)
+    // field 4 should still decode
+    var t4: ProtoTag = r.readTag()
+    test.assertEqual(t4.field, 4)
+    test.assertEqual(r.readBool(), true)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 15 skip — " + string(e)) }
+
+// 16 — bytes round-trip
+try {
+    var payload = Buffer.fromArray([0, 255, 16, 128, 1])
+    var w = new ProtoWriter()
+    w.writeBytes(1, payload)
+    var r = new ProtoReader(w.toBuffer())
+    r.readTag()
+    var got: Buffer = r.readBytes()
+    test.assertEqual(got.equals(payload), true)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 16 bytes — " + string(e)) }
+
+print("═══════════════════════════════════════")
+print("  protobuf codec test results")
+print("  Passed: " + string(passed))
+print("  Failed: " + string(failed))
+print("  Total:  " + string(passed + failed))
+print("═══════════════════════════════════════")

@@ -1,0 +1,6 @@
+# Compiled Chuks artifacts
+build/
+*.bin
+
+# OS noise
+.DS_Store

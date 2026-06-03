@@ -1,0 +1,149 @@
+// ─── chuks_grpc · HPACK tests ──────────────────────────────────────────────
+// Decodes real RFC 7541 example header blocks (raw AND Huffman-coded),
+// validates the dynamic table, and round-trips the encoder.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { test } from "std/test"
+import { Buffer } from "std/buffer"
+import { HpackDecoder, HpackEncoder, HpackHeader } from "../src/hpack.chuks"
+
+var passed: any = 0
+var failed: any = 0
+
+function mk(name: string, value: string): HpackHeader {
+    var h: HpackHeader = { name: name, value: value }
+    return h
+}
+
+// 1 — RFC C.4.1: request with Huffman-coded :authority value
+try {
+    var dec = new HpackDecoder(4096)
+    var block = Buffer.fromHex("828684418cf1e3c2e5f23a6ba0ab90f4ff")
+    var hs: []HpackHeader = dec.decode(block)
+    test.assertEqual(hs.length, 4)
+    test.assertEqual(hs[0].name, ":method");    test.assertEqual(hs[0].value, "GET")
+    test.assertEqual(hs[1].name, ":scheme");    test.assertEqual(hs[1].value, "http")
+    test.assertEqual(hs[2].name, ":path");      test.assertEqual(hs[2].value, "/")
+    test.assertEqual(hs[3].name, ":authority"); test.assertEqual(hs[3].value, "www.example.com")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 1 C.4.1 — " + string(e)) }
+
+// 2 — RFC C.6.1: response with Huffman-coded values (status, date, location)
+try {
+    var dec = new HpackDecoder(256)
+    var hex = "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3"
+    var hs: []HpackHeader = dec.decode(Buffer.fromHex(hex))
+    test.assertEqual(hs.length, 4)
+    test.assertEqual(hs[0].name, ":status");       test.assertEqual(hs[0].value, "302")
+    test.assertEqual(hs[1].name, "cache-control"); test.assertEqual(hs[1].value, "private")
+    test.assertEqual(hs[2].name, "date");          test.assertEqual(hs[2].value, "Mon, 21 Oct 2013 20:13:21 GMT")
+    test.assertEqual(hs[3].name, "location");      test.assertEqual(hs[3].value, "https://www.example.com")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 2 C.6.1 — " + string(e)) }
+
+// 3 — Dynamic table persistence across two blocks (RFC C.3.1 then C.3.2)
+try {
+    var dec = new HpackDecoder(4096)
+    // First request adds (:authority, www.example.com) at index 62.
+    var b1 = Buffer.fromHex("828684410f7777772e6578616d706c652e636f6d")
+    var r1: []HpackHeader = dec.decode(b1)
+    test.assertEqual(r1.length, 4)
+    test.assertEqual(r1[3].name, ":authority")
+    test.assertEqual(r1[3].value, "www.example.com")
+    // Second request references that dynamic entry (0xbe) + adds cache-control.
+    var b2 = Buffer.fromHex("828684be58086e6f2d6361636865")
+    var r2: []HpackHeader = dec.decode(b2)
+    test.assertEqual(r2.length, 5)
+    test.assertEqual(r2[3].name, ":authority")
+    test.assertEqual(r2[3].value, "www.example.com")
+    test.assertEqual(r2[4].name, "cache-control")
+    test.assertEqual(r2[4].value, "no-cache")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 3 dynamic table — " + string(e)) }
+
+// 4 — Encoder: full static match → single indexed byte
+try {
+    var enc = new HpackEncoder(4096)
+    var out: Buffer = enc.encode([mk(":method", "GET")])
+    test.assertEqual(out.toString("hex"), "82")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 4 encode indexed — " + string(e)) }
+
+// 5 — Encoder: :status 200 → 0x88
+try {
+    var enc = new HpackEncoder(4096)
+    var out: Buffer = enc.encode([mk(":status", "200")])
+    test.assertEqual(out.toString("hex"), "88")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 5 encode status — " + string(e)) }
+
+// 6 — Encode → decode round-trip of a realistic gRPC response header set
+try {
+    var enc = new HpackEncoder(4096)
+    var dec = new HpackDecoder(4096)
+    var headers: []HpackHeader = [
+        mk(":status", "200"),
+        mk("content-type", "application/grpc"),
+        mk("grpc-encoding", "identity"),
+        mk("grpc-accept-encoding", "identity,deflate,gzip")
+    ]
+    var block: Buffer = enc.encode(headers)
+    var back: []HpackHeader = dec.decode(block)
+    test.assertEqual(back.length, 4)
+    var i: int = 0
+    while (i < 4) {
+        test.assertEqual(back[i].name, headers[i].name)
+        test.assertEqual(back[i].value, headers[i].value)
+        i = i + 1
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 6 round-trip — " + string(e)) }
+
+// 7 — Encode → decode a gRPC request header set (path, authority, te trailers)
+try {
+    var enc = new HpackEncoder(4096)
+    var dec = new HpackDecoder(4096)
+    var headers: []HpackHeader = [
+        mk(":method", "POST"),
+        mk(":scheme", "http"),
+        mk(":path", "/helloworld.Greeter/SayHello"),
+        mk(":authority", "localhost:50051"),
+        mk("content-type", "application/grpc"),
+        mk("te", "trailers"),
+        mk("user-agent", "grpc-chuks/0.1")
+    ]
+    var block: Buffer = enc.encode(headers)
+    var back: []HpackHeader = dec.decode(block)
+    test.assertEqual(back.length, 7)
+    var i: int = 0
+    while (i < 7) {
+        test.assertEqual(back[i].name, headers[i].name)
+        test.assertEqual(back[i].value, headers[i].value)
+        i = i + 1
+    }
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 7 request round-trip — " + string(e)) }
+
+// 8 — Trailers block (grpc-status / grpc-message) round-trip
+try {
+    var enc = new HpackEncoder(4096)
+    var dec = new HpackDecoder(4096)
+    var trailers: []HpackHeader = [
+        mk("grpc-status", "0"),
+        mk("grpc-message", "")
+    ]
+    var back: []HpackHeader = dec.decode(enc.encode(trailers))
+    test.assertEqual(back.length, 2)
+    test.assertEqual(back[0].name, "grpc-status")
+    test.assertEqual(back[0].value, "0")
+    test.assertEqual(back[1].name, "grpc-message")
+    test.assertEqual(back[1].value, "")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 8 trailers — " + string(e)) }
+
+print("═══════════════════════════════════════")
+print("  HPACK test results")
+print("  Passed: " + string(passed))
+print("  Failed: " + string(failed))
+print("  Total:  " + string(passed + failed))
+print("═══════════════════════════════════════")

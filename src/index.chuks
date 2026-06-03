@@ -1,0 +1,440 @@
+// ─── chuks_grpc · gRPC over HTTP/2 (h2c) ───────────────────────────────────
+// A wire-compatible gRPC server and client built on the HTTP/2 frame layer
+// (http2.chuks), HPACK header coding (hpack.chuks), gRPC length-prefixed
+// message framing (framing.chuks) and Protocol Buffers (protobuf.chuks).
+//
+// This implements gRPC over cleartext HTTP/2 ("h2c", a.k.a. prior-knowledge
+// HTTP/2). It interoperates with standard tooling that speaks plaintext gRPC,
+// e.g. `grpcurl -plaintext`, Go's `grpc.WithTransportCredentials(insecure...)`,
+// and Java's `usePlaintext()`.
+//
+// Scope of v1:
+//   • Unary RPCs (one request message → one response message).
+//   • Single HEADERS frame per header block (no CONTINUATION).
+//   • No built-in TLS server (std/net exposes a plaintext listener only).
+//   • No .proto codegen — you serialize/deserialize with ProtoWriter/Reader.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { TcpConnection, TcpServer } from "std/net"
+import { Buffer } from "std/buffer"
+import {
+    CONNECTION_PREFACE,
+    FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, FRAME_PING,
+    FRAME_GOAWAY, FRAME_RST_STREAM, FRAME_WINDOW_UPDATE,
+    FLAG_END_STREAM, FLAG_ACK,
+    Http2Frame, Http2Setting,
+    settingsFrame, headersFrame, dataFrame, pingFrame, windowUpdateFrame
+} from "./http2.chuks"
+import { HpackEncoder, HpackDecoder, HpackHeader } from "./hpack.chuks"
+import { GrpcFrameDecoder, frameMessage } from "./framing.chuks"
+
+// ─── gRPC status codes (grpc-status trailer) ───────────────────────────────
+
+export const STATUS_OK: int = 0
+export const STATUS_CANCELLED: int = 1
+export const STATUS_UNKNOWN: int = 2
+export const STATUS_INVALID_ARGUMENT: int = 3
+export const STATUS_DEADLINE_EXCEEDED: int = 4
+export const STATUS_NOT_FOUND: int = 5
+export const STATUS_ALREADY_EXISTS: int = 6
+export const STATUS_PERMISSION_DENIED: int = 7
+export const STATUS_RESOURCE_EXHAUSTED: int = 8
+export const STATUS_FAILED_PRECONDITION: int = 9
+export const STATUS_ABORTED: int = 10
+export const STATUS_OUT_OF_RANGE: int = 11
+export const STATUS_UNIMPLEMENTED: int = 12
+export const STATUS_INTERNAL: int = 13
+export const STATUS_UNAVAILABLE: int = 14
+export const STATUS_DATA_LOSS: int = 15
+export const STATUS_UNAUTHENTICATED: int = 16
+
+// ─── Public message types ──────────────────────────────────────────────────
+
+// A decoded unary request handed to a server handler.
+export dataType GrpcRequest {
+    method: string;        // full path, e.g. "/echo.Echo/Say"
+    data: Buffer;          // raw (already de-framed) request message bytes
+    metadata: []HpackHeader;
+}
+
+// A unary response returned by a server handler.
+export dataType GrpcResponse {
+    data: Buffer;          // raw response message bytes (will be gRPC-framed)
+    status: int;           // grpc-status; use STATUS_OK on success
+    message: string;       // grpc-message (human-readable, on error)
+}
+
+// A reply received by the client after a unary call.
+export dataType GrpcReply {
+    data: Buffer;
+    status: int;
+    message: string;
+}
+
+// ─── Convenience constructors ──────────────────────────────────────────────
+
+// Build a successful response from raw message bytes.
+export function grpcOk(data: Buffer): GrpcResponse {
+    var r: GrpcResponse = { data: data, status: STATUS_OK, message: "" }
+    return r
+}
+
+// Build an error response with a status code and message (no body).
+export function grpcError(status: int, message: string): GrpcResponse {
+    var none: []any = []
+    var r: GrpcResponse = { data: Buffer.fromArray(none), status: status, message: message }
+    return r
+}
+
+// ─── Internal helpers ──────────────────────────────────────────────────────
+
+function emptyBuf(): Buffer {
+    var none: []any = []
+    return Buffer.fromArray(none)
+}
+
+function noSettings(): []Http2Setting {
+    var s: []Http2Setting = []
+    return s
+}
+
+// Look up a header value by (lowercase) name; returns "" if absent.
+function headerValue(headers: []HpackHeader, name: string): string {
+    var i: int = 0
+    while (i < headers.length) {
+        if (headers[i].name == name) {
+            return headers[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Parse a non-negative decimal integer (e.g. a grpc-status value).
+function parseDecimal(s: string): int {
+    var b: Buffer = Buffer.fromString(s)
+    var n: int = b.length()
+    var val: int = 0
+    var i: int = 0
+    while (i < n) {
+        var c: int = b.getByte(i)
+        if (c >= 48 && c <= 57) {
+            val = val * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return val
+}
+
+// Blocking read of one whole HTTP/2 frame from a connection.
+// Throws when the peer closes the connection (readExact hits EOF).
+function readFrameConn(conn: TcpConnection): Http2Frame {
+    var hdr: Buffer = conn.readExact(9)
+    var len: int = (hdr.getByte(0) << 16) | (hdr.getByte(1) << 8) | hdr.getByte(2)
+    var ftype: int = hdr.getByte(3)
+    var flags: int = hdr.getByte(4)
+    var sid: int = ((hdr.getByte(5) & 0x7F) << 24) | (hdr.getByte(6) << 16) | (hdr.getByte(7) << 8) | hdr.getByte(8)
+    var payload: Buffer = emptyBuf()
+    if (len > 0) {
+        payload = conn.readExact(len)
+    }
+    var f: Http2Frame = { ftype: ftype, flags: flags, streamId: sid, payload: payload }
+    return f
+}
+
+// ─── Per-stream server state ───────────────────────────────────────────────
+
+class GrpcStreamState {
+    var path: string
+    var metadata: []HpackHeader
+    var decoder: GrpcFrameDecoder
+
+    constructor(path: string, metadata: []HpackHeader) {
+        this.path = path
+        this.metadata = metadata
+        this.decoder = new GrpcFrameDecoder()
+    }
+}
+
+// ─── Server ────────────────────────────────────────────────────────────────
+
+export class GrpcServer {
+    var _server: TcpServer
+    var _handlers: map[string]any
+
+    // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
+    // it back via addr().
+    constructor(host: string, port: int) {
+        this._server = new TcpServer(host, port)
+        this._handlers = {}
+    }
+
+    // Register a unary handler for a fully-qualified method path, e.g.
+    // "/package.Service/Method". The handler signature is
+    //   function(req: GrpcRequest): GrpcResponse
+    public register(method: string, handler: any): void {
+        this._handlers[method] = handler
+    }
+
+    // The address the server is listening on ("host:port").
+    public addr(): string {
+        return this._server.addr()
+    }
+
+    // Accept connections forever, handling each to completion before accepting
+    // the next. Each connection may carry multiple sequential RPCs.
+    public serve(): void {
+        while (true) {
+            var conn: TcpConnection = this._server.accept()
+            try {
+                this._handleConnection(conn)
+            } catch (e) {
+                // Connection-level failure (EOF, malformed frame): drop it.
+            }
+        }
+    }
+
+    // Accept and fully handle exactly one connection, then return. Useful for
+    // tests and request/response tooling.
+    public serveOnce(): void {
+        var conn: TcpConnection = this._server.accept()
+        try {
+            this._handleConnection(conn)
+        } catch (e) {
+            // ignore — peer closed
+        }
+    }
+
+    public close(): void {
+        this._server.close()
+    }
+
+    // ── HTTP/2 connection lifecycle ──────────────────────────────────────────
+
+    private _handleConnection(conn: TcpConnection): void {
+        // 1. Consume the 24-byte client connection preface.
+        conn.readExact(24)
+        // 2. Emit our SETTINGS frame as the connection preface.
+        conn.writeAll(settingsFrame(noSettings(), false))
+
+        var hdec: HpackDecoder = new HpackDecoder(null)
+        var henc: HpackEncoder = new HpackEncoder(null)
+        var streams: map[int]GrpcStreamState = {}
+        var open: bool = true
+
+        while (open) {
+            var frame: Http2Frame = readFrameConn(conn)
+
+            if (frame.ftype == FRAME_SETTINGS) {
+                if ((frame.flags & FLAG_ACK) == 0) {
+                    conn.writeAll(settingsFrame(noSettings(), true))
+                }
+            } else if (frame.ftype == FRAME_HEADERS) {
+                var headers: []HpackHeader = hdec.decode(frame.payload)
+                var path: string = headerValue(headers, ":path")
+                var st: GrpcStreamState = new GrpcStreamState(path, headers)
+                streams[frame.streamId] = st
+                // Client closed the stream with no body — dispatch empty.
+                if ((frame.flags & FLAG_END_STREAM) != 0) {
+                    this._dispatch(conn, henc, frame.streamId, st)
+                    streams.delete(frame.streamId)
+                }
+            } else if (frame.ftype == FRAME_DATA) {
+                if (streams.has(frame.streamId)) {
+                    var ds: GrpcStreamState = streams[frame.streamId]
+                    ds.decoder.push(frame.payload)
+                    // Replenish flow-control windows for what we consumed.
+                    var plen: int = frame.payload.length()
+                    if (plen > 0) {
+                        conn.writeAll(windowUpdateFrame(0, plen))
+                        conn.writeAll(windowUpdateFrame(frame.streamId, plen))
+                    }
+                    if ((frame.flags & FLAG_END_STREAM) != 0) {
+                        this._dispatch(conn, henc, frame.streamId, ds)
+                        streams.delete(frame.streamId)
+                    }
+                }
+            } else if (frame.ftype == FRAME_PING) {
+                if ((frame.flags & FLAG_ACK) == 0) {
+                    conn.writeAll(pingFrame(frame.payload, true))
+                }
+            } else if (frame.ftype == FRAME_RST_STREAM) {
+                if (streams.has(frame.streamId)) {
+                    streams.delete(frame.streamId)
+                }
+            } else if (frame.ftype == FRAME_GOAWAY) {
+                open = false
+            } else if (frame.ftype == FRAME_WINDOW_UPDATE) {
+                // We send small responses that fit the default window; ignore.
+            }
+        }
+
+        conn.close()
+    }
+
+    // ── Dispatch one completed request stream ────────────────────────────────
+
+    private _dispatch(conn: TcpConnection, henc: HpackEncoder, streamId: int, st: GrpcStreamState): void {
+        var reqData: Buffer = emptyBuf()
+        var msg: any = st.decoder.next()
+        if (msg != null) {
+            reqData = msg.data
+        }
+
+        if (!this._handlers.has(st.path)) {
+            this._sendTrailersOnly(conn, henc, streamId, STATUS_UNIMPLEMENTED, "method not found: " + st.path)
+            return
+        }
+
+        var req: GrpcRequest = { method: st.path, data: reqData, metadata: st.metadata }
+        var handler: any = this._handlers[st.path]
+        var resp: GrpcResponse = { data: emptyBuf(), status: STATUS_INTERNAL, message: "" }
+
+        try {
+            resp = handler(req)
+        } catch (e) {
+            this._sendTrailersOnly(conn, henc, streamId, STATUS_INTERNAL, string(e))
+            return
+        }
+
+        if (resp.status != STATUS_OK) {
+            this._sendTrailersOnly(conn, henc, streamId, resp.status, resp.message)
+            return
+        }
+
+        this._sendResponse(conn, henc, streamId, resp)
+    }
+
+    // Full unary response: HEADERS (200) + DATA (message) + trailers.
+    private _sendResponse(conn: TcpConnection, henc: HpackEncoder, streamId: int, resp: GrpcResponse): void {
+        var h1: HpackHeader = { name: ":status", value: "200" }
+        var h2: HpackHeader = { name: "content-type", value: "application/grpc" }
+        var respHdrs: []HpackHeader = [h1, h2]
+        var headBlock: Buffer = henc.encode(respHdrs)
+        conn.writeAll(headersFrame(streamId, headBlock, false, true))
+
+        var framed: Buffer = frameMessage(resp.data)
+        conn.writeAll(dataFrame(streamId, framed, false))
+
+        var t1: HpackHeader = { name: "grpc-status", value: string(resp.status) }
+        var t2: HpackHeader = { name: "grpc-message", value: resp.message }
+        var trailers: []HpackHeader = [t1, t2]
+        var trailerBlock: Buffer = henc.encode(trailers)
+        conn.writeAll(headersFrame(streamId, trailerBlock, true, true))
+    }
+
+    // Trailers-only response (used for errors / unimplemented): a single
+    // HEADERS frame carrying :status 200 plus grpc-status/grpc-message, with
+    // END_STREAM set.
+    private _sendTrailersOnly(conn: TcpConnection, henc: HpackEncoder, streamId: int, status: int, message: string): void {
+        var h1: HpackHeader = { name: ":status", value: "200" }
+        var h2: HpackHeader = { name: "content-type", value: "application/grpc" }
+        var h3: HpackHeader = { name: "grpc-status", value: string(status) }
+        var h4: HpackHeader = { name: "grpc-message", value: message }
+        var hdrs: []HpackHeader = [h1, h2, h3, h4]
+        var block: Buffer = henc.encode(hdrs)
+        conn.writeAll(headersFrame(streamId, block, true, true))
+    }
+}
+
+// ─── Client ────────────────────────────────────────────────────────────────
+
+export class GrpcClient {
+    var _conn: TcpConnection
+    var _enc: HpackEncoder
+    var _dec: HpackDecoder
+    var _streamId: int
+    var _authority: string
+
+    // Connect over cleartext HTTP/2 and exchange the connection preface.
+    constructor(host: string, port: int) {
+        this._conn = new TcpConnection(host, port)
+        this._authority = host + ":" + string(port)
+        // Client preface: the magic string immediately followed by SETTINGS.
+        this._conn.writeAll(Buffer.fromString(CONNECTION_PREFACE))
+        this._conn.writeAll(settingsFrame(noSettings(), false))
+        this._enc = new HpackEncoder(null)
+        this._dec = new HpackDecoder(null)
+        this._streamId = 1
+    }
+
+    public close(): void {
+        this._conn.close()
+    }
+
+    // Perform a unary RPC: send one request message, await one reply.
+    public unary(method: string, message: Buffer): GrpcReply {
+        var sid: int = this._streamId
+        this._streamId = this._streamId + 2
+
+        // Request HEADERS (pseudo-headers first, per HTTP/2).
+        var h1: HpackHeader = { name: ":method", value: "POST" }
+        var h2: HpackHeader = { name: ":scheme", value: "http" }
+        var h3: HpackHeader = { name: ":path", value: method }
+        var h4: HpackHeader = { name: ":authority", value: this._authority }
+        var h5: HpackHeader = { name: "content-type", value: "application/grpc" }
+        var h6: HpackHeader = { name: "te", value: "trailers" }
+        var reqHdrs: []HpackHeader = [h1, h2, h3, h4, h5, h6]
+        var block: Buffer = this._enc.encode(reqHdrs)
+        this._conn.writeAll(headersFrame(sid, block, false, true))
+
+        // Request body: a single length-prefixed message, closing the stream.
+        var framed: Buffer = frameMessage(message)
+        this._conn.writeAll(dataFrame(sid, framed, true))
+
+        // Collect response frames until the server half-closes (END_STREAM).
+        var bodyDec: GrpcFrameDecoder = new GrpcFrameDecoder()
+        var status: int = STATUS_UNKNOWN
+        var statusMsg: string = ""
+        var respData: Buffer = emptyBuf()
+        var done: bool = false
+
+        while (!done) {
+            var frame: Http2Frame = readFrameConn(this._conn)
+
+            if (frame.ftype == FRAME_SETTINGS) {
+                if ((frame.flags & FLAG_ACK) == 0) {
+                    this._conn.writeAll(settingsFrame(noSettings(), true))
+                }
+            } else if (frame.ftype == FRAME_HEADERS) {
+                if (frame.streamId == sid) {
+                    var hl: []HpackHeader = this._dec.decode(frame.payload)
+                    var gs: string = headerValue(hl, "grpc-status")
+                    if (gs != "") {
+                        status = parseDecimal(gs)
+                        statusMsg = headerValue(hl, "grpc-message")
+                    }
+                    if ((frame.flags & FLAG_END_STREAM) != 0) {
+                        done = true
+                    }
+                }
+            } else if (frame.ftype == FRAME_DATA) {
+                if (frame.streamId == sid) {
+                    bodyDec.push(frame.payload)
+                    var m: any = bodyDec.next()
+                    if (m != null) {
+                        respData = m.data
+                    }
+                    // Replenish windows so larger responses keep flowing.
+                    var plen: int = frame.payload.length()
+                    if (plen > 0) {
+                        this._conn.writeAll(windowUpdateFrame(0, plen))
+                        this._conn.writeAll(windowUpdateFrame(sid, plen))
+                    }
+                    if ((frame.flags & FLAG_END_STREAM) != 0) {
+                        done = true
+                    }
+                }
+            } else if (frame.ftype == FRAME_PING) {
+                if ((frame.flags & FLAG_ACK) == 0) {
+                    this._conn.writeAll(pingFrame(frame.payload, true))
+                }
+            } else if (frame.ftype == FRAME_GOAWAY) {
+                done = true
+            }
+        }
+
+        var reply: GrpcReply = { data: respData, status: status, message: statusMsg }
+        return reply
+    }
+}

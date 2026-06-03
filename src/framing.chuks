@@ -1,0 +1,97 @@
+// ─── chuks_grpc · gRPC message framing ─────────────────────────────────────
+// Inside HTTP/2 DATA frames, gRPC carries "length-prefixed messages":
+//
+//   ┌────────────┬───────────────────┬───────────────────────────┐
+//   │ 1 byte     │ 4 bytes (BE)      │ N bytes                   │
+//   │ compressed │ message length N  │ message (serialized proto)│
+//   └────────────┴───────────────────┴───────────────────────────┘
+//
+// This module encodes single messages and decodes a byte stream (which may
+// split or coalesce messages across DATA frames) back into whole messages.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { Buffer } from "std/buffer"
+
+// Encode one message into a length-prefixed gRPC frame.
+// `compressed` should be false unless a compression codec was negotiated.
+export function encodeMessage(msg: Buffer, compressed: bool): Buffer {
+    var header = new Buffer(5)
+    if (compressed) {
+        header.writeUInt8(1)
+    } else {
+        header.writeUInt8(0)
+    }
+    header.writeUInt32BE(msg.length())
+    return Buffer.concat([header, msg])
+}
+
+// Convenience: encode an uncompressed message.
+export function frameMessage(msg: Buffer): Buffer {
+    return encodeMessage(msg, false)
+}
+
+// One decoded gRPC message together with its compression flag.
+export dataType GrpcMessage {
+    compressed: bool;
+    data: Buffer;
+}
+
+// Streaming decoder: feed raw bytes via push(), pull whole messages via next().
+// Handles partial frames (length prefix or body split across pushes) and
+// multiple messages coalesced into a single push.
+export class GrpcFrameDecoder {
+    var _pending: []int
+
+    constructor() {
+        this._pending = []
+    }
+
+    // Append received bytes to the internal buffer.
+    public push(data: Buffer): void {
+        var n: int = data.length()
+        var i: int = 0
+        while (i < n) {
+            this._pending.push(data.getByte(i))
+            i = i + 1
+        }
+    }
+
+    // Number of buffered bytes not yet consumed.
+    public buffered(): int {
+        return this._pending.length
+    }
+
+    // Returns the next complete message, or null if a full frame isn't buffered.
+    public next(): GrpcMessage? {
+        var avail: int = this._pending.length
+        if (avail < 5) {
+            var none: GrpcMessage? = null
+            return none
+        }
+        var flag: int = this._pending[0]
+        var len: int = (this._pending[1] << 24) | (this._pending[2] << 16) | (this._pending[3] << 8) | this._pending[4]
+        if (avail < 5 + len) {
+            var none: GrpcMessage? = null
+            return none
+        }
+
+        var arr: []any = []
+        var i: int = 5
+        while (i < 5 + len) {
+            arr.push(this._pending[i])
+            i = i + 1
+        }
+
+        // Drop the consumed frame from the front of the pending buffer.
+        var rest: []int = []
+        var j: int = 5 + len
+        while (j < avail) {
+            rest.push(this._pending[j])
+            j = j + 1
+        }
+        this._pending = rest
+
+        var msg: GrpcMessage = { compressed: flag != 0, data: Buffer.fromArray(arr) }
+        return msg
+    }
+}
