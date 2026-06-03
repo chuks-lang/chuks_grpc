@@ -390,11 +390,11 @@ function responseHeaders(): []HpackHeader {
 // ─── Message compression (grpc-encoding negotiation) ───────────────────────
 // gRPC negotiates per-message compression via two headers:
 //   • grpc-encoding         — the codec used for outbound messages ("gzip" or
-//                             "identity"); also set on responses by the server.
+    //                             "identity"); also set on responses by the server.
 //   • grpc-accept-encoding  — a comma list of codecs the sender can decode.
 // Each length-prefixed frame carries a 1-byte "compressed" flag, so the receiver
 // decodes purely from that flag (we only ship the gzip codec, so a set flag
-// always means gzip). Tiny payloads can grow once framed/compressed; that is
+    // always means gzip). Tiny payloads can grow once framed/compressed; that is
 // expected and harmless.
 
 export const ENCODING_IDENTITY: string = "identity"
@@ -428,7 +428,7 @@ function sendEncoded(st: Http2Stream, data: Buffer, encoding: string): void {
 }
 
 // Decode an inbound message: decompress when its compressed flag is set (the
-// only codec we negotiate is gzip), otherwise return the raw bytes.
+    // only codec we negotiate is gzip), otherwise return the raw bytes.
 function decodeMessage(m: GrpcMessage): Buffer {
     if (m.compressed) {
         return compress.gunzip(m.data)
@@ -669,7 +669,7 @@ export class GrpcServer {
     // order (outermost first) around every unary handler:
     //   function(req: GrpcRequest, next: any): GrpcResponse
     // Call `next(req)` to proceed to the next interceptor (and finally the
-    // handler); return a GrpcResponse without calling `next` to short-circuit.
+        // handler); return a GrpcResponse without calling `next` to short-circuit.
     public useUnaryInterceptor(interceptor: any): void {
         this._unaryInterceptors.push(interceptor)
     }
@@ -678,7 +678,7 @@ export class GrpcServer {
     // client-streaming and bidi handler in registration order:
     //   function(stream: GrpcServerStream, next: any): void
     // Call `next(stream)` to proceed. An interceptor that short-circuits (does
-    // not call `next`) is responsible for finishing the stream itself.
+        // not call `next`) is responsible for finishing the stream itself.
     public useStreamInterceptor(interceptor: any): void {
         this._streamInterceptors.push(interceptor)
     }
@@ -714,6 +714,22 @@ export class GrpcServer {
     // The address the server is listening on ("host:port").
     public addr(): string {
         return this._server.addr()
+    }
+
+    // The distinct fully-qualified service names derived from every registered
+    // method path ("/pkg.Service/Method" → "pkg.Service"). Used by the server
+    // reflection service (M16) to advertise what this server hosts.
+    public serviceNames(): []string {
+        var seen: map[string]bool = {}
+        var out: []string = []
+        for (var path in this._handlers) {
+            var name: string = _serviceNameFromPath(path)
+            if (name.length > 0 && !seen.has(name)) {
+                seen[name] = true
+                out.push(name)
+            }
+        }
+        return out
     }
 
     // Accept connections forever, serving each on its own task so multiple
@@ -1011,7 +1027,7 @@ export class GrpcClient {
 
     // Enable HTTP/2 keepalive: ping the server every `timeMs` and tear the
     // connection down if no PING ACK arrives within `timeoutMs` (in-flight calls
-    // then fail with UNAVAILABLE). Detects half-open / dead connections so calls
+        // then fail with UNAVAILABLE). Detects half-open / dead connections so calls
     // fail fast instead of hanging. Call once after constructing the client.
     public enableKeepalive(timeMs: int, timeoutMs: int): void {
         this._h2.enableKeepalive(timeMs, timeoutMs)
@@ -1035,7 +1051,7 @@ export class GrpcClient {
     // order (outermost first) around every unary call:
     //   function(method: string, message: Buffer, md: Metadata, next: any): GrpcReply
     // Call `next(method, message, md)` to issue the RPC (possibly with modified
-    // arguments); inspect or replace the returned GrpcReply, or short-circuit by
+        // arguments); inspect or replace the returned GrpcReply, or short-circuit by
     // returning a GrpcReply without calling `next`.
     public useUnaryInterceptor(interceptor: any): void {
         this._unaryInterceptors.push(interceptor)
@@ -1304,20 +1320,20 @@ export function resolveStatic(target: string): []Endpoint {
             port = 0
             sawColon = false
         } else if (c == 58) {                    // ':'
-            sawColon = true
-        } else if (c == 32 || c == 9) {          // skip spaces/tabs
-            i = i + 1
-            continue
-        } else if (sawColon) {
-            if (c >= 48 && c <= 57) {            // accumulate port digits
-                port = port * 10 + (c - 48)
-            }
-        } else {
-            hostBytes.push(c)                    // accumulate host bytes
-        }
-        i = i + 1
+        sawColon = true
+    } else if (c == 32 || c == 9) {          // skip spaces/tabs
+    i = i + 1
+    continue
+} else if (sawColon) {
+    if (c >= 48 && c <= 57) {            // accumulate port digits
+        port = port * 10 + (c - 48)
     }
-    return out
+} else {
+    hostBytes.push(c)                    // accumulate host bytes
+}
+i = i + 1
+}
+return out
 }
 
 export class GrpcChannel {
@@ -1617,8 +1633,8 @@ export class HealthService {
     }
 
     // Server-streaming Watch handler: emits the current status once. (A full
-    // Watch streams status changes over time; this reports the present state,
-    // which covers readiness probing and health-aware load balancing.)
+        // Watch streams status changes over time; this reports the present state,
+        // which covers readiness probing and health-aware load balancing.)
     public watch(req: GrpcRequest, stream: GrpcServerStream): void {
         var service: string = decodeHealthService(req.data)
         stream.send(encodeHealthResponse(this.statusOf(service)))
@@ -1659,5 +1675,250 @@ export class HealthClient {
     // Convenience: true only when `service` reports SERVING.
     public isServing(service: string): bool {
         return this.check(service) == SERVING_SERVING
+    }
+}
+
+// ─── Server reflection (grpc.reflection.v1alpha.ServerReflection) ───────────
+// The standard gRPC reflection protocol lets tools like grpcurl discover the
+// services a server hosts at runtime without a local .proto. It is a single
+// bidirectional-streaming RPC, ServerReflectionInfo, where each request names
+// one query and the server replies with the matching response.
+//
+// This implements the list_services query — the one grpcurl uses for
+// `grpcurl <addr> list` and for interop discovery (M20). Descriptor queries
+// (file_by_filename, file_containing_symbol, …) require full FileDescriptorProto
+// encoding, which is out of scope here; those are answered honestly with an
+// UNIMPLEMENTED ErrorResponse rather than a wrong descriptor.
+
+// The reflection v1alpha bidi-streaming method path.
+export const REFLECTION_V1ALPHA_PATH: string = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
+
+// ServerReflectionRequest.message_request oneof field numbers.
+export const REFLECT_FILE_BY_FILENAME: int = 3
+export const REFLECT_FILE_CONTAINING_SYMBOL: int = 4
+export const REFLECT_ALL_EXTENSION_NUMBERS: int = 6
+export const REFLECT_LIST_SERVICES: int = 7
+
+// A decoded ServerReflectionRequest: `kind` is the field number of the
+// message_request oneof that was set (0 = none), `value` its string payload.
+export dataType ReflectionRequest {
+    host: string;
+    kind: int;
+    value: string;
+}
+
+// Extract the service name from a full method path "/pkg.Service/Method".
+// ASCII byte scan (service names are ASCII) avoids rune/byte index pitfalls.
+function _serviceNameFromPath(path: string): string {
+    var b: Buffer = Buffer.fromString(path)
+    var n: int = b.length()
+    var start: int = 0
+    if (n > 0 && b.getByte(0) == 47) {   // leading '/'
+        start = 1
+    }
+    var out: []any = []
+    var i: int = start
+    while (i < n) {
+        var c: int = b.getByte(i)
+        if (c == 47) {   // next '/' ends the service name
+            break
+        }
+        out.push(c)
+        i = i + 1
+    }
+    return Buffer.fromArray(out).toStringUtf8()
+}
+
+// Decode a ServerReflectionRequest. host = field 1; the message_request oneof is
+// any of fields 3/4/6/7 (all length-delimited strings here).
+function decodeReflectionRequest(data: Buffer): ReflectionRequest {
+    var r: ProtoReader = new ProtoReader(data)
+    var host: string = ""
+    var kind: int = 0
+    var value: string = ""
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 1 && tag.wireType == PB_LEN) {
+            host = r.readString()
+        } else if (tag.wireType == PB_LEN && (tag.field == REFLECT_FILE_BY_FILENAME || tag.field == REFLECT_FILE_CONTAINING_SYMBOL || tag.field == REFLECT_ALL_EXTENSION_NUMBERS || tag.field == REFLECT_LIST_SERVICES)) {
+            kind = tag.field
+            value = r.readString()
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    var out: ReflectionRequest = { host: host, kind: kind, value: value }
+    return out
+}
+
+// Encode a list_services request (message_request = list_services, field 7).
+// The conventional payload is "*" (list everything).
+function encodeListServicesRequest(): Buffer {
+    var w: ProtoWriter = new ProtoWriter()
+    w.writeString(REFLECT_LIST_SERVICES, "*")
+    return w.toBuffer()
+}
+
+// Encode a ServerReflectionResponse carrying a ListServiceResponse (field 6):
+//   ListServiceResponse { repeated ServiceResponse service = 1; }
+//   ServiceResponse     { string name = 1; }
+// `rawRequest` is echoed back as original_request (field 2).
+function encodeListServices(rawRequest: Buffer, host: string, services: []string): Buffer {
+    var list: ProtoWriter = new ProtoWriter()
+    var i: int = 0
+    while (i < services.length) {
+        var svc: ProtoWriter = new ProtoWriter()
+        svc.writeString(1, services[i])   // ServiceResponse.name = 1
+        list.writeMessage(1, svc)         // ListServiceResponse.service = 1 (repeated)
+        i = i + 1
+    }
+    var resp: ProtoWriter = new ProtoWriter()
+    if (host.length > 0) {
+        resp.writeString(1, host)         // valid_host = 1
+    }
+    resp.writeBytes(2, rawRequest)        // original_request = 2 (echo)
+    resp.writeMessage(6, list)            // list_services_response = 6
+    return resp.toBuffer()
+}
+
+// Encode a ServerReflectionResponse carrying an ErrorResponse (field 7):
+//   ErrorResponse { int32 error_code = 1; string error_message = 2; }
+function encodeReflectionError(rawRequest: Buffer, host: string, code: int, message: string): Buffer {
+    var err: ProtoWriter = new ProtoWriter()
+    err.writeInt32(1, code)               // error_code = 1
+    err.writeString(2, message)           // error_message = 2
+    var resp: ProtoWriter = new ProtoWriter()
+    if (host.length > 0) {
+        resp.writeString(1, host)
+    }
+    resp.writeBytes(2, rawRequest)
+    resp.writeMessage(7, err)             // error_response = 7
+    return resp.toBuffer()
+}
+
+// Decode the service names from a ListServiceResponse-bearing
+// ServerReflectionResponse (field 6 → repeated ServiceResponse, name = field 1).
+function decodeListServicesResponse(data: Buffer): []string {
+    var r: ProtoReader = new ProtoReader(data)
+    var out: []string = []
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 6 && tag.wireType == PB_LEN) {
+            var list: ProtoReader = r.readMessage()
+            while (list.hasMore()) {
+                var lt: ProtoTag = list.readTag()
+                if (lt.field == 1 && lt.wireType == PB_LEN) {
+                    var svc: ProtoReader = list.readMessage()
+                    while (svc.hasMore()) {
+                        var st: ProtoTag = svc.readTag()
+                        if (st.field == 1 && st.wireType == PB_LEN) {
+                            out.push(svc.readString())
+                        } else {
+                            svc.skip(st.wireType)
+                        }
+                    }
+                } else {
+                    list.skip(lt.wireType)
+                }
+            }
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return out
+}
+
+// Server-side reflection service. Advertises a set of fully-qualified service
+// names; register it on a GrpcServer with registerReflectionService(server, r).
+// The reflection service itself is always advertised.
+export class ReflectionService {
+    var _services: []string
+
+    constructor() {
+        var s: []string = []
+        this._services = s
+        this._services.push("grpc.reflection.v1alpha.ServerReflection")
+    }
+
+    // Advertise a fully-qualified service name (e.g. "pkg.Service"). Idempotent.
+    public addService(name: string): void {
+        var i: int = 0
+        while (i < this._services.length) {
+            if (this._services[i] == name) {
+                return
+            }
+            i = i + 1
+        }
+        this._services.push(name)
+    }
+
+    // Advertise every service derived from a server's registered method paths.
+    public addServerServices(server: GrpcServer): void {
+        var names: []string = server.serviceNames()
+        var i: int = 0
+        while (i < names.length) {
+            this.addService(names[i])
+            i = i + 1
+        }
+    }
+
+    // The advertised service names.
+    public services(): []string {
+        return this._services
+    }
+
+    // Bidi handler for ServerReflectionInfo: answer each request until the
+    // client half-closes. list_services is fully supported; other queries get
+    // an UNIMPLEMENTED ErrorResponse.
+    public serve(stream: GrpcServerStream): void {
+        while (true) {
+            var msg: Buffer? = stream.recv()
+            if (msg != null) {
+                var req: ReflectionRequest = decodeReflectionRequest(msg)
+                if (req.kind == REFLECT_LIST_SERVICES) {
+                    stream.send(encodeListServices(msg, req.host, this._services))
+                } else {
+                    stream.send(encodeReflectionError(msg, req.host, STATUS_UNIMPLEMENTED, "reflection request not supported: only list_services"))
+                }
+            } else {
+                return
+            }
+        }
+    }
+}
+
+// Register a ReflectionService on `server` at the reflection method path.
+// Module-level (like registerHealthService) so the handler closure runs in a
+// non-class frame and only touches the service's public surface.
+export function registerReflectionService(server: GrpcServer, refl: ReflectionService): void {
+    server.registerBidiStream(REFLECTION_V1ALPHA_PATH, function(stream: GrpcServerStream): void {
+        refl.serve(stream)
+    })
+}
+
+// Client-side reflection probe over an existing GrpcClient.
+export class ReflectionClient {
+    var _client: GrpcClient
+
+    constructor(client: GrpcClient) {
+        this._client = client
+    }
+
+    // List the services advertised by the server (reflection list_services).
+    public listServices(): []string {
+        var call: GrpcClientCall = this._client.bidiStream(REFLECTION_V1ALPHA_PATH)
+        call.send(encodeListServicesRequest())
+        call.closeSend()
+        var out: []string = []
+        var m: Buffer? = call.recv()
+        if (m != null) {
+            out = decodeListServicesResponse(m)
+        }
+        var extra: Buffer? = call.recv()
+        while (extra != null) {
+            extra = call.recv()
+        }
+        call.result()
+        return out
     }
 }

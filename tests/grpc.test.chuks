@@ -15,6 +15,7 @@ import {
     GrpcChannel, Endpoint, mkEndpoint, resolveStatic, LB_PICK_FIRST, LB_ROUND_ROBIN,
     HealthService, HealthClient, registerHealthService,
     SERVING_SERVING, SERVING_NOT_SERVING, SERVING_SERVICE_UNKNOWN,
+    ReflectionService, ReflectionClient, registerReflectionService,
     STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED,
     STATUS_UNAVAILABLE, STATUS_INVALID_ARGUMENT
 } from "../src/index.chuks"
@@ -174,7 +175,7 @@ async function runServer(srv: GrpcServer): Task<void> {
 
 // Unary handler that echoes the peer's mTLS certificate Common Name, so the
 // client can assert the server authenticated it (cn=chuks for our self-signed
-// cert, cn= for plaintext / server-only TLS).
+    // cert, cn= for plaintext / server-only TLS).
 function peerHandler(req: GrpcRequest): GrpcResponse {
     return grpcOk(encodeName("cn=" + req.peerCN))
 }
@@ -220,7 +221,7 @@ function tagStream(stream: GrpcServerStream, next: any): void {
 
 // ── Retry fixtures (M13) ────────────────────────────────────────────────────
 // Per-test call counters (each test uses a fresh server, so a module-level
-// counter is reset explicitly before the test by assigning back to 0).
+    // counter is reset explicitly before the test by assigning back to 0).
 var flaky29: any = 0
 var flaky30: any = 0
 var flaky31: any = 0
@@ -1073,6 +1074,120 @@ try {
     await t39
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 39 dead endpoint skipped — " + string(e)) }
+
+// ── Server reflection fixtures (M16) ────────────────────────────────────────
+function reflSayHandler(req: GrpcRequest): GrpcResponse { return grpcOk(encodeName("hi")) }
+function reflCountHandler(req: GrpcRequest, stream: GrpcServerStream): void { stream.send(encodeName("1")) }
+
+// 40 — reflection list_services advertises every registered service plus itself
+try {
+    var srv40: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv40.register("/echo.Echo/Say", reflSayHandler)
+    srv40.registerServerStream("/echo.Echo/Count", reflCountHandler)
+    srv40.register("/calc.Math/Add", reflSayHandler)
+    var refl40: ReflectionService = new ReflectionService()
+    refl40.addServerServices(srv40)
+    registerReflectionService(srv40, refl40)
+    var port40: int = portOf(srv40.addr())
+    var t40: Task<void> = spawn runServer(srv40)
+
+    var client40: GrpcClient = new GrpcClient("127.0.0.1", port40)
+    var rc40: ReflectionClient = new ReflectionClient(client40)
+    var svcs40: []string = rc40.listServices()
+    // echo.Echo, calc.Math, the reflection service, plus the registered
+    // reflection method's own path-derived name — assert membership, not order.
+    var hasEcho40: bool = false
+    var hasMath40: bool = false
+    var hasRefl40: bool = false
+    var i40: int = 0
+    while (i40 < svcs40.length) {
+        if (svcs40[i40] == "echo.Echo") { hasEcho40 = true }
+        if (svcs40[i40] == "calc.Math") { hasMath40 = true }
+        if (svcs40[i40] == "grpc.reflection.v1alpha.ServerReflection") { hasRefl40 = true }
+        i40 = i40 + 1
+    }
+    test.assert(hasEcho40)
+    test.assert(hasMath40)
+    test.assert(hasRefl40)
+    client40.close()
+    await t40
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 40 reflection list_services — " + string(e)) }
+
+// 41 — GrpcServer.serviceNames derives distinct names from method paths
+try {
+    var srv41: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv41.register("/echo.Echo/Say", reflSayHandler)
+    srv41.register("/echo.Echo/Shout", reflSayHandler)   // same service, second method
+    srv41.register("/calc.Math/Add", reflSayHandler)
+    var names41: []string = srv41.serviceNames()
+    // Two distinct services despite three methods (echo.Echo collapses).
+    test.assertEqual(names41.length, 2)
+    var hasEcho41: bool = false
+    var hasMath41: bool = false
+    var i41: int = 0
+    while (i41 < names41.length) {
+        if (names41[i41] == "echo.Echo") { hasEcho41 = true }
+        if (names41[i41] == "calc.Math") { hasMath41 = true }
+        i41 = i41 + 1
+    }
+    test.assert(hasEcho41)
+    test.assert(hasMath41)
+    srv41.close()
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 41 serviceNames distinct — " + string(e)) }
+
+// 42 — an unsupported reflection query yields an honest UNIMPLEMENTED error
+try {
+    var srv42: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv42.register("/echo.Echo/Say", reflSayHandler)
+    var refl42: ReflectionService = new ReflectionService()
+    refl42.addServerServices(srv42)
+    registerReflectionService(srv42, refl42)
+    var port42: int = portOf(srv42.addr())
+    var t42: Task<void> = spawn runServer(srv42)
+
+    var client42: GrpcClient = new GrpcClient("127.0.0.1", port42)
+    // Hand-craft a file_containing_symbol request (field 4) — not supported.
+    var rq42: ProtoWriter = new ProtoWriter()
+    rq42.writeString(4, "echo.Echo")
+    var call42: GrpcClientCall = client42.bidiStream("/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo")
+    call42.send(rq42.toBuffer())
+    call42.closeSend()
+    var resp42: Buffer? = call42.recv()
+    test.assert(resp42 != null)
+    // Decode the ServerReflectionResponse: expect an ErrorResponse (field 7)
+    // carrying error_code (field 1) == UNIMPLEMENTED.
+    var code42: int = -1
+    if (resp42 != null) {
+        var rr42: ProtoReader = new ProtoReader(resp42)
+        while (rr42.hasMore()) {
+            var tg42: ProtoTag = rr42.readTag()
+            if (tg42.field == 7 && tg42.wireType == PB_LEN) {
+                var er42: ProtoReader = rr42.readMessage()
+                while (er42.hasMore()) {
+                    var et42: ProtoTag = er42.readTag()
+                    if (et42.field == 1) {
+                        code42 = er42.readVarint()
+                    } else {
+                        er42.skip(et42.wireType)
+                    }
+                }
+            } else {
+                rr42.skip(tg42.wireType)
+            }
+        }
+    }
+    test.assertEqual(code42, STATUS_UNIMPLEMENTED)
+    var drain42: Buffer? = call42.recv()
+    while (drain42 != null) {
+        drain42 = call42.recv()
+    }
+    call42.result()
+    client42.close()
+    await t42
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 42 reflection unsupported query — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")
