@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package demo;
+
+// Exercises scalars, enums, repeated (packed + non-packed), nested messages,
+// and all four RPC kinds.
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  RED = 1;
+  GREEN = 2;
+  BLUE = 3;
+}
+
+message Inner {
+  string label = 1;
+  int32 weight = 2;
+}
+
+message AllTypes {
+  string name = 1;
+  int32 i32 = 2;
+  int64 i64 = 3;
+  uint32 u32 = 4;
+  sint32 s32 = 5;
+  bool flag = 6;
+  float f = 7;
+  double d = 8;
+  fixed32 fx32 = 9;
+  sfixed32 sfx32 = 10;
+  bytes blob = 11;
+  Color color = 12;
+  Inner inner = 13;
+  repeated int32 nums = 14;        // packed
+  repeated string tags = 15;       // non-packed
+  repeated Inner items = 16;       // repeated message
+  repeated Color palette = 17;     // packed enum
+}
+
+service Demo {
+  rpc Unary (AllTypes) returns (AllTypes);
+  rpc ServerStream (Inner) returns (stream Inner);
+  rpc ClientStream (stream Inner) returns (Inner);
+  rpc Bidi (stream Inner) returns (stream Inner);
+}

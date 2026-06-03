@@ -1,0 +1,822 @@
+// ─── chuks_grpc · protogen ─────────────────────────────────────────────────
+// A pragmatic proto3 → Chuks code generator.
+//
+//   chuks run tools/protogen.chuks <file.proto> [importBase]
+//
+// Reads a .proto file and emits "<file>.pb.chuks" beside it containing:
+//   • a dataType per message (proto3 scalars, bytes, enums, nested messages,
+//     and repeated scalar/string/bytes/message fields)
+//   • default<Name>() zero-value factories
+//   • encode<Name>(m) / encodeWriter<Name>(m) / decode<Name>(buf) codecs
+//   • <ENUM>_<VALUE> integer constants
+//   • <Service>_<Method>_PATH route constants
+//   • a typed <Service>Client (unary methods return decoded responses;
+//     streaming methods return a GrpcClientCall to drive with the codecs)
+//
+// `importBase` is the import path prefix for protobuf.chuks / index.chuks
+// (default "../src"). Not supported: oneof, map<>, well-known types.
+// ───────────────────────────────────────────────────────────────────────────
+
+import { Buffer } from "std/buffer"
+import { fs } from "std/fs"
+import { os } from "std/os"
+
+// ─── Parsed model ──────────────────────────────────────────────────────────
+
+dataType Field {
+    label: string;    // "singular" | "repeated"
+    ftype: string;    // proto type (simple name)
+    name: string;
+    number: int;
+}
+
+dataType Message {
+    name: string;
+    fields: []Field;
+}
+
+dataType EnumVal {
+    name: string;
+    number: int;
+}
+
+dataType EnumDef {
+    name: string;
+    values: []EnumVal;
+}
+
+dataType Rpc {
+    name: string;
+    reqType: string;
+    respType: string;
+    cstream: bool;
+    sstream: bool;
+}
+
+dataType Service {
+    name: string;
+    rpcs: []Rpc;
+}
+
+// ─── Lexer ─────────────────────────────────────────────────────────────────
+
+function isIdentByte(c: int): bool {
+    if (c >= 48 && c <= 57) { return true }    // 0-9
+    if (c >= 65 && c <= 90) { return true }    // A-Z
+    if (c >= 97 && c <= 122) { return true }   // a-z
+    if (c == 95) { return true }               // _
+    if (c == 46) { return true }               // . (qualified names)
+    return false
+}
+
+function tokenize(src: Buffer): []string {
+    var toks: []string = []
+    var n: int = src.length()
+    var i: int = 0
+    while (i < n) {
+        var c: int = src.getByte(i)
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            i = i + 1
+        } else if (c == 47 && i + 1 < n && src.getByte(i + 1) == 47) {
+            // line comment //
+            i = i + 2
+            while (i < n && src.getByte(i) != 10) { i = i + 1 }
+        } else if (c == 47 && i + 1 < n && src.getByte(i + 1) == 42) {
+            // block comment /* */
+            i = i + 2
+            while (i + 1 < n && !(src.getByte(i) == 42 && src.getByte(i + 1) == 47)) { i = i + 1 }
+            i = i + 2
+        } else if (c == 34) {
+            // string literal
+            var sb: []any = []
+            i = i + 1
+            while (i < n && src.getByte(i) != 34) { sb.push(src.getByte(i)); i = i + 1 }
+            i = i + 1
+            toks.push("\"" + Buffer.fromArray(sb).toStringUtf8() + "\"")
+        } else if (isIdentByte(c)) {
+            var ib: []any = []
+            while (i < n && isIdentByte(src.getByte(i))) { ib.push(src.getByte(i)); i = i + 1 }
+            toks.push(Buffer.fromArray(ib).toStringUtf8())
+        } else {
+            var pb: []any = [c]
+            toks.push(Buffer.fromArray(pb).toStringUtf8())
+            i = i + 1
+        }
+    }
+    return toks
+}
+
+// Parse a non-negative decimal token to int.
+function toInt(s: string): int {
+    var b: Buffer = Buffer.fromString(s)
+    var n: int = b.length()
+    var v: int = 0
+    var i: int = 0
+    var neg: bool = false
+    if (n > 0 && b.getByte(0) == 45) { neg = true; i = 1 }
+    while (i < n) {
+        var c: int = b.getByte(i)
+        if (c >= 48 && c <= 57) { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    if (neg) { return -v }
+    return v
+}
+
+// ─── Parser (holds token stream + accumulated schema) ──────────────────────
+
+class Parser {
+    var toks: []string
+    var pos: int
+    var pkg: string
+    var messages: []Message
+    var enums: []EnumDef
+    var services: []Service
+
+    constructor(t: []string) {
+        this.toks = t
+        this.pos = 0
+        this.pkg = ""
+        var m: []Message = []
+        this.messages = m
+        var e: []EnumDef = []
+        this.enums = e
+        var s: []Service = []
+        this.services = s
+    }
+
+    public peek(): string {
+        if (this.pos < this.toks.length) { return this.toks[this.pos] }
+        return ""
+    }
+
+    public next(): string {
+        var t: string = this.peek()
+        this.pos = this.pos + 1
+        return t
+    }
+
+    public accept(s: string): bool {
+        if (this.peek() == s) { this.pos = this.pos + 1; return true }
+        return false
+    }
+
+    public expect(s: string): void {
+        if (!this.accept(s)) {
+            throw "protogen: expected '" + s + "' but got '" + this.peek() + "'"
+        }
+    }
+
+    public skipToSemi(): void {
+        while (this.pos < this.toks.length && this.peek() != ";") { this.next() }
+        this.accept(";")
+    }
+
+    // Skip a balanced { ... } block (assumes next token is "{").
+    public skipBlock(): void {
+        this.expect("{")
+        var depth: int = 1
+        while (this.pos < this.toks.length && depth > 0) {
+            var t: string = this.next()
+            if (t == "{") { depth = depth + 1 }
+            else if (t == "}") { depth = depth - 1 }
+        }
+    }
+
+    public parse(): void {
+        while (this.pos < this.toks.length) {
+            var t: string = this.next()
+            if (t == "syntax") {
+                this.expect("="); this.next(); this.expect(";")
+            } else if (t == "package") {
+                this.pkg = this.next(); this.expect(";")
+            } else if (t == "option") {
+                this.skipToSemi()
+            } else if (t == "import") {
+                this.skipToSemi()
+            } else if (t == "message") {
+                this.parseMessage()
+            } else if (t == "enum") {
+                this.parseEnum()
+            } else if (t == "service") {
+                this.parseService()
+            }
+        }
+    }
+
+    public parseMessage(): void {
+        var name: string = simpleName(this.next())
+        this.expect("{")
+        var fields: []Field = []
+        while (this.peek() != "}" && this.pos < this.toks.length) {
+            var t: string = this.peek()
+            if (t == "message") {
+                this.next(); this.parseMessage()
+            } else if (t == "enum") {
+                this.next(); this.parseEnum()
+            } else if (t == "reserved" || t == "option") {
+                this.skipToSemi()
+            } else if (t == "oneof") {
+                // Flatten oneof members as singular fields.
+                this.next(); this.next()   // oneof <name>
+                this.expect("{")
+                while (this.peek() != "}" && this.pos < this.toks.length) {
+                    if (this.peek() == "option") { this.skipToSemi() }
+                    else { this.parseField(fields, "singular") }
+                }
+                this.expect("}")
+            } else if (t == "repeated") {
+                this.next(); this.parseField(fields, "repeated")
+            } else if (t == "optional") {
+                this.next(); this.parseField(fields, "singular")
+            } else if (t == ";") {
+                this.next()
+            } else {
+                this.parseField(fields, "singular")
+            }
+        }
+        this.expect("}")
+        var msg: Message = { name: name, fields: fields }
+        this.messages.push(msg)
+    }
+
+    // Parse "<type> <name> = <number> [opts];" (label prefix already consumed).
+    public parseField(fields: []Field, label: string): void {
+        var ftype: string = simpleName(this.next())
+        var fname: string = this.next()
+        this.expect("=")
+        var num: int = toInt(this.next())
+        if (this.peek() == "[") {
+            while (this.pos < this.toks.length && this.next() != "]") { }
+        }
+        this.expect(";")
+        var f: Field = { label: label, ftype: ftype, name: fname, number: num }
+        fields.push(f)
+    }
+
+    public parseEnum(): void {
+        var name: string = simpleName(this.next())
+        this.expect("{")
+        var vals: []EnumVal = []
+        while (this.peek() != "}" && this.pos < this.toks.length) {
+            var t: string = this.peek()
+            if (t == "option" || t == "reserved") {
+                this.skipToSemi()
+            } else if (t == ";") {
+                this.next()
+            } else {
+                var vn: string = this.next()
+                this.expect("=")
+                var num: int = toInt(this.next())
+                if (this.peek() == "[") {
+                    while (this.pos < this.toks.length && this.next() != "]") { }
+                }
+                this.expect(";")
+                var ev: EnumVal = { name: vn, number: num }
+                vals.push(ev)
+            }
+        }
+        this.expect("}")
+        var ed: EnumDef = { name: name, values: vals }
+        this.enums.push(ed)
+    }
+
+    public parseService(): void {
+        var name: string = simpleName(this.next())
+        this.expect("{")
+        var rpcs: []Rpc = []
+        while (this.peek() != "}" && this.pos < this.toks.length) {
+            var t: string = this.peek()
+            if (t == "rpc") {
+                this.next()
+                var m: string = this.next()
+                this.expect("(")
+                var cstream: bool = false
+                if (this.peek() == "stream") { cstream = true; this.next() }
+                var req: string = simpleName(this.next())
+                this.expect(")")
+                this.expect("returns")
+                this.expect("(")
+                var sstream: bool = false
+                if (this.peek() == "stream") { sstream = true; this.next() }
+                var resp: string = simpleName(this.next())
+                this.expect(")")
+                if (this.peek() == "{") { this.skipBlock() } else { this.expect(";") }
+                var rpc: Rpc = { name: m, reqType: req, respType: resp, cstream: cstream, sstream: sstream }
+                rpcs.push(rpc)
+            } else if (t == "option") {
+                this.skipToSemi()
+            } else {
+                this.next()
+            }
+        }
+        this.expect("}")
+        var svc: Service = { name: name, rpcs: rpcs }
+        this.services.push(svc)
+    }
+}
+
+// Last dotted segment of a (possibly qualified) name. ".echo.Foo" -> "Foo".
+function simpleName(t: string): string {
+    var b: Buffer = Buffer.fromString(t)
+    var n: int = b.length()
+    var last: int = -1
+    var i: int = 0
+    while (i < n) {
+        if (b.getByte(i) == 46) { last = i }   // '.'
+        i = i + 1
+    }
+    if (last < 0) { return t }
+    var out: []any = []
+    var j: int = last + 1
+    while (j < n) { out.push(b.getByte(j)); j = j + 1 }
+    return Buffer.fromArray(out).toStringUtf8()
+}
+
+function inList(name: string, arr: []string): bool {
+    var i: int = 0
+    while (i < arr.length) {
+        if (arr[i] == name) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── Type mapping ──────────────────────────────────────────────────────────
+
+function scalarChuksType(ft: string): string {
+    if (ft == "double" || ft == "float") { return "float" }
+    if (ft == "bool") { return "bool" }
+    if (ft == "string") { return "string" }
+    if (ft == "bytes") { return "Buffer" }
+    // all integer families
+    return "int"
+}
+
+function isScalar(ft: string): bool {
+    if (ft == "double" || ft == "float" || ft == "bool" || ft == "string" || ft == "bytes") { return true }
+    if (ft == "int32" || ft == "int64" || ft == "uint32" || ft == "uint64") { return true }
+    if (ft == "sint32" || ft == "sint64" || ft == "fixed32" || ft == "fixed64") { return true }
+    if (ft == "sfixed32" || ft == "sfixed64") { return true }
+    return false
+}
+
+// Scalar writer method (singular).
+function scalarWriter(ft: string): string {
+    if (ft == "double") { return "writeDouble" }
+    if (ft == "float") { return "writeFloat" }
+    if (ft == "bool") { return "writeBool" }
+    if (ft == "string") { return "writeString" }
+    if (ft == "bytes") { return "writeBytes" }
+    if (ft == "int32") { return "writeInt32" }
+    if (ft == "int64") { return "writeInt64" }
+    if (ft == "uint32" || ft == "uint64") { return "writeUInt" }
+    if (ft == "sint32" || ft == "sint64") { return "writeSInt" }
+    if (ft == "fixed32" || ft == "sfixed32") { return "writeFixed32" }
+    if (ft == "fixed64" || ft == "sfixed64") { return "writeFixed64" }
+    return "writeInt32"
+}
+
+// Scalar reader method (singular element).
+function scalarReader(ft: string): string {
+    if (ft == "double") { return "readDouble" }
+    if (ft == "float") { return "readFloat" }
+    if (ft == "bool") { return "readBool" }
+    if (ft == "string") { return "readString" }
+    if (ft == "bytes") { return "readBytes" }
+    if (ft == "int32" || ft == "int64") { return "readInt" }
+    if (ft == "uint32" || ft == "uint64") { return "readUInt" }
+    if (ft == "sint32" || ft == "sint64") { return "readSInt" }
+    if (ft == "fixed32") { return "readFixed32" }
+    if (ft == "fixed64") { return "readFixed64" }
+    if (ft == "sfixed32") { return "readSFixed32" }
+    if (ft == "sfixed64") { return "readSFixed64" }
+    return "readInt"
+}
+
+// Packed writer for a repeated numeric scalar.
+function packedWriter(ft: string): string {
+    if (ft == "double") { return "writePackedDouble" }
+    if (ft == "float") { return "writePackedFloat" }
+    if (ft == "bool") { return "writePackedBool" }
+    if (ft == "int32" || ft == "int64") { return "writePackedInt32" }
+    if (ft == "uint32" || ft == "uint64") { return "writePackedUInt" }
+    if (ft == "sint32" || ft == "sint64") { return "writePackedSInt" }
+    if (ft == "fixed32" || ft == "sfixed32") { return "writePackedFixed32" }
+    if (ft == "fixed64" || ft == "sfixed64") { return "writePackedFixed64" }
+    return "writePackedInt32"
+}
+
+// Packed reader for a repeated numeric scalar.
+function packedReader(ft: string): string {
+    if (ft == "double") { return "readPackedDouble" }
+    if (ft == "float") { return "readPackedFloat" }
+    if (ft == "bool") { return "readPackedBool" }
+    if (ft == "sint32" || ft == "sint64") { return "readPackedSInt" }
+    if (ft == "fixed32" || ft == "fixed64" || ft == "sfixed32" || ft == "sfixed64") {
+        if (ft == "fixed32" || ft == "sfixed32") { return "readPackedFixed32" }
+        return "readPackedFixed64"
+    }
+    return "readPackedVarint"
+}
+
+function wireConst(ft: string): string {
+    if (ft == "double" || ft == "fixed64" || ft == "sfixed64") { return "PB_I64" }
+    if (ft == "float" || ft == "fixed32" || ft == "sfixed32") { return "PB_I32" }
+    return "PB_VARINT"
+}
+
+// String-typed packed (string/bytes are never packed; handled per element).
+function isPackable(ft: string): bool {
+    if (ft == "string" || ft == "bytes") { return false }
+    return isScalar(ft)
+}
+
+// ─── Code generation ───────────────────────────────────────────────────────
+
+function genHeader(protoName: string, importBase: string): string {
+    var s: string = ""
+    s = s + "// Code generated by chuks_grpc protogen from " + protoName + ". DO NOT EDIT.\n"
+    s = s + "// Regenerate: chuks run tools/protogen.chuks " + protoName + "\n\n"
+    s = s + "import { Buffer } from \"std/buffer\"\n"
+    s = s + "import { ProtoWriter, ProtoReader, ProtoTag, PB_VARINT, PB_I32, PB_I64, PB_LEN } from \"" + importBase + "/protobuf.chuks\"\n"
+    s = s + "import { GrpcClient, GrpcClientCall, GrpcReply } from \"" + importBase + "/index.chuks\"\n\n"
+    return s
+}
+
+function fieldChuksType(f: Field, enumNames: []string): string {
+    var base: string = ""
+    if (isScalar(f.ftype)) {
+        base = scalarChuksType(f.ftype)
+    } else if (inList(f.ftype, enumNames)) {
+        base = "int"
+    } else {
+        base = f.ftype   // message
+    }
+    if (f.label == "repeated") { return "[]" + base }
+    return base
+}
+
+function genMessageType(m: Message, enumNames: []string): string {
+    var s: string = "export dataType " + m.name + " {\n"
+    var i: int = 0
+    while (i < m.fields.length) {
+        var f: Field = m.fields[i]
+        s = s + "    " + f.name + ": " + fieldChuksType(f, enumNames) + ";\n"
+        i = i + 1
+    }
+    s = s + "}\n\n"
+    return s
+}
+
+function defaultLiteralFor(f: Field, enumNames: []string): string {
+    if (f.label == "repeated") { return "_" + f.name }   // built as local
+    if (isScalar(f.ftype)) {
+        var ct: string = scalarChuksType(f.ftype)
+        if (ct == "float") { return "0.0" }
+        if (ct == "bool") { return "false" }
+        if (ct == "string") { return "\"\"" }
+        if (ct == "Buffer") { return "_emptyBuf()" }
+        return "0"
+    }
+    if (inList(f.ftype, enumNames)) { return "0" }
+    return "default" + f.ftype + "()"   // nested message
+}
+
+function genDefault(m: Message, enumNames: []string): string {
+    var s: string = "export function default" + m.name + "(): " + m.name + " {\n"
+    // repeated fields need typed local arrays
+    var i: int = 0
+    while (i < m.fields.length) {
+        var f: Field = m.fields[i]
+        if (f.label == "repeated") {
+            s = s + "    var _" + f.name + ": " + fieldChuksType(f, enumNames) + " = []\n"
+        }
+        i = i + 1
+    }
+    s = s + "    var _m: " + m.name + " = {"
+    i = 0
+    while (i < m.fields.length) {
+        var f2: Field = m.fields[i]
+        if (i > 0) { s = s + "," }
+        s = s + " " + f2.name + ": " + defaultLiteralFor(f2, enumNames)
+        i = i + 1
+    }
+    s = s + " }\n    return _m\n}\n\n"
+    return s
+}
+
+function genEncode(m: Message, enumNames: []string): string {
+    var s: string = "export function encodeWriter" + m.name + "(m: " + m.name + "): ProtoWriter {\n"
+    s = s + "    var w: ProtoWriter = new ProtoWriter()\n"
+    var i: int = 0
+    while (i < m.fields.length) {
+        var f: Field = m.fields[i]
+        var acc: string = "m." + f.name
+        var num: string = string(f.number)
+        if (f.label == "repeated") {
+            if (isPackable(f.ftype)) {
+                s = s + "    if (" + acc + ".length > 0) { w." + packedWriter(f.ftype) + "(" + num + ", " + acc + ") }\n"
+            } else if (f.ftype == "string") {
+                s = s + "    var _i" + num + ": int = 0\n"
+                s = s + "    while (_i" + num + " < " + acc + ".length) {\n"
+                s = s + "        w.writeString(" + num + ", " + acc + "[_i" + num + "])\n"
+                s = s + "        _i" + num + " = _i" + num + " + 1\n    }\n"
+            } else if (f.ftype == "bytes") {
+                s = s + "    var _i" + num + ": int = 0\n"
+                s = s + "    while (_i" + num + " < " + acc + ".length) {\n"
+                s = s + "        w.writeBytes(" + num + ", " + acc + "[_i" + num + "])\n"
+                s = s + "        _i" + num + " = _i" + num + " + 1\n    }\n"
+            } else if (inList(f.ftype, enumNames)) {
+                s = s + "    if (" + acc + ".length > 0) { w.writePackedInt32(" + num + ", " + acc + ") }\n"
+            } else {
+                // repeated message
+                s = s + "    var _i" + num + ": int = 0\n"
+                s = s + "    while (_i" + num + " < " + acc + ".length) {\n"
+                s = s + "        w.writeMessage(" + num + ", encodeWriter" + f.ftype + "(" + acc + "[_i" + num + "]))\n"
+                s = s + "        _i" + num + " = _i" + num + " + 1\n    }\n"
+            }
+        } else {
+            if (isScalar(f.ftype)) {
+                var ct: string = scalarChuksType(f.ftype)
+                if (ct == "string") {
+                    s = s + "    if (" + acc + " != \"\") { w.writeString(" + num + ", " + acc + ") }\n"
+                } else if (ct == "Buffer") {
+                    s = s + "    if (" + acc + ".length() > 0) { w.writeBytes(" + num + ", " + acc + ") }\n"
+                } else if (ct == "bool") {
+                    s = s + "    if (" + acc + ") { w.writeBool(" + num + ", " + acc + ") }\n"
+                } else if (ct == "float") {
+                    s = s + "    if (" + acc + " != 0.0) { w." + scalarWriter(f.ftype) + "(" + num + ", " + acc + ") }\n"
+                } else {
+                    s = s + "    if (" + acc + " != 0) { w." + scalarWriter(f.ftype) + "(" + num + ", " + acc + ") }\n"
+                }
+            } else if (inList(f.ftype, enumNames)) {
+                s = s + "    if (" + acc + " != 0) { w.writeInt32(" + num + ", " + acc + ") }\n"
+            } else {
+                // singular message: omit when it encodes to zero bytes
+                s = s + "    var _sw" + num + ": ProtoWriter = encodeWriter" + f.ftype + "(" + acc + ")\n"
+                s = s + "    if (_sw" + num + ".length() > 0) { w.writeMessage(" + num + ", _sw" + num + ") }\n"
+            }
+        }
+        i = i + 1
+    }
+    s = s + "    return w\n}\n\n"
+    s = s + "export function encode" + m.name + "(m: " + m.name + "): Buffer {\n"
+    s = s + "    return encodeWriter" + m.name + "(m).toBuffer()\n}\n\n"
+    return s
+}
+
+function genDecode(m: Message, enumNames: []string): string {
+    var s: string = "export function decode" + m.name + "(data: Buffer): " + m.name + " {\n"
+    // locals for every field, defaulted
+    var i: int = 0
+    while (i < m.fields.length) {
+        var f: Field = m.fields[i]
+        s = s + "    var _" + f.name + ": " + fieldChuksType(f, enumNames) + " = " + decodeInit(f, enumNames) + "\n"
+        i = i + 1
+    }
+    s = s + "    var r: ProtoReader = new ProtoReader(data)\n"
+    s = s + "    while (r.hasMore()) {\n"
+    s = s + "        var tag: ProtoTag = r.readTag()\n"
+    i = 0
+    while (i < m.fields.length) {
+        var f3: Field = m.fields[i]
+        var kw: string = "if"
+        if (i > 0) { kw = "} else if" }
+        s = s + "        " + kw + " (tag.field == " + string(f3.number) + ") {\n"
+        s = s + decodeBody(f3, enumNames)
+        i = i + 1
+    }
+    if (m.fields.length > 0) {
+        s = s + "        } else {\n            r.skip(tag.wireType)\n        }\n"
+    } else {
+        s = s + "        r.skip(tag.wireType)\n"
+    }
+    s = s + "    }\n"
+    s = s + "    var _m: " + m.name + " = {"
+    i = 0
+    while (i < m.fields.length) {
+        var f4: Field = m.fields[i]
+        if (i > 0) { s = s + "," }
+        s = s + " " + f4.name + ": _" + f4.name
+        i = i + 1
+    }
+    s = s + " }\n    return _m\n}\n\n"
+    return s
+}
+
+function decodeInit(f: Field, enumNames: []string): string {
+    if (f.label == "repeated") { return "[]" }
+    if (isScalar(f.ftype)) {
+        var ct: string = scalarChuksType(f.ftype)
+        if (ct == "float") { return "0.0" }
+        if (ct == "bool") { return "false" }
+        if (ct == "string") { return "\"\"" }
+        if (ct == "Buffer") { return "_emptyBuf()" }
+        return "0"
+    }
+    if (inList(f.ftype, enumNames)) { return "0" }
+    return "default" + f.ftype + "()"
+}
+
+function decodeBody(f: Field, enumNames: []string): string {
+    var s: string = ""
+    var acc: string = "_" + f.name
+    if (f.label == "repeated") {
+        if (isPackable(f.ftype)) {
+            s = s + "            if (tag.wireType == PB_LEN) {\n"
+            s = s + "                var _vs: " + fieldChuksType(f, enumNames) + " = r." + packedReader(f.ftype) + "()\n"
+            s = s + "                var _k: int = 0\n"
+            s = s + "                while (_k < _vs.length) {\n"
+            s = s + "                    " + acc + ".push(_vs[_k])\n"
+            s = s + "                    _k = _k + 1\n                }\n"
+            s = s + "            } else {\n"
+            s = s + "                " + acc + ".push(r." + scalarReader(f.ftype) + "())\n"
+            s = s + "            }\n"
+        } else if (f.ftype == "string") {
+            s = s + "            " + acc + ".push(r.readString())\n"
+        } else if (f.ftype == "bytes") {
+            s = s + "            " + acc + ".push(r.readBytes())\n"
+        } else if (inList(f.ftype, enumNames)) {
+            s = s + "            if (tag.wireType == PB_LEN) {\n"
+            s = s + "                var _vs: []int = r.readPackedVarint()\n"
+            s = s + "                var _k: int = 0\n"
+            s = s + "                while (_k < _vs.length) {\n"
+            s = s + "                    " + acc + ".push(_vs[_k])\n"
+            s = s + "                    _k = _k + 1\n                }\n"
+            s = s + "            } else {\n"
+            s = s + "                " + acc + ".push(r.readInt())\n"
+            s = s + "            }\n"
+        } else {
+            s = s + "            " + acc + ".push(decode" + f.ftype + "(r.readBytes()))\n"
+        }
+    } else {
+        if (isScalar(f.ftype)) {
+            s = s + "            " + acc + " = r." + scalarReader(f.ftype) + "()\n"
+        } else if (inList(f.ftype, enumNames)) {
+            s = s + "            " + acc + " = r.readInt()\n"
+        } else {
+            s = s + "            " + acc + " = decode" + f.ftype + "(r.readBytes())\n"
+        }
+    }
+    return s
+}
+
+function genEnum(e: EnumDef): string {
+    var s: string = "// enum " + e.name + "\n"
+    var i: int = 0
+    while (i < e.values.length) {
+        var v: EnumVal = e.values[i]
+        s = s + "export const " + e.name + "_" + v.name + ": int = " + string(v.number) + "\n"
+        i = i + 1
+    }
+    s = s + "\n"
+    return s
+}
+
+function methodPath(pkg: string, service: string, method: string): string {
+    if (pkg == "") { return "/" + service + "/" + method }
+    return "/" + pkg + "." + service + "/" + method
+}
+
+function genService(svc: Service, pkg: string): string {
+    var s: string = ""
+    // path constants
+    var i: int = 0
+    while (i < svc.rpcs.length) {
+        var rp: Rpc = svc.rpcs[i]
+        s = s + "export const " + svc.name + "_" + rp.name + "_PATH: string = \"" + methodPath(pkg, svc.name, rp.name) + "\"\n"
+        i = i + 1
+    }
+    s = s + "\n"
+    // typed client
+    s = s + "export class " + svc.name + "Client {\n"
+    s = s + "    var _c: GrpcClient\n\n"
+    s = s + "    constructor(c: GrpcClient) {\n        this._c = c\n    }\n\n"
+    i = 0
+    while (i < svc.rpcs.length) {
+        var r2: Rpc = svc.rpcs[i]
+        var path: string = svc.name + "_" + r2.name + "_PATH"
+        if (!r2.cstream && !r2.sstream) {
+            // unary -> decoded response
+            s = s + "    public " + r2.name + "(req: " + r2.reqType + "): " + r2.respType + " {\n"
+            s = s + "        var rep: GrpcReply = this._c.unary(" + path + ", encode" + r2.reqType + "(req))\n"
+            s = s + "        return decode" + r2.respType + "(rep.data)\n    }\n\n"
+        } else if (!r2.cstream && r2.sstream) {
+            // server streaming -> call (decode each recv with decode<Resp>)
+            s = s + "    // server-streaming: recv() bytes; decode with decode" + r2.respType + "().\n"
+            s = s + "    public " + r2.name + "(req: " + r2.reqType + "): GrpcClientCall {\n"
+            s = s + "        return this._c.serverStream(" + path + ", encode" + r2.reqType + "(req))\n    }\n\n"
+        } else if (r2.cstream && !r2.sstream) {
+            // client streaming -> call (send encode<Req>(x); decode reply with decode<Resp>)
+            s = s + "    // client-streaming: send encode" + r2.reqType + "(x), closeSend(), then result().\n"
+            s = s + "    public " + r2.name + "(): GrpcClientCall {\n"
+            s = s + "        return this._c.clientStream(" + path + ")\n    }\n\n"
+        } else {
+            // bidi -> call
+            s = s + "    // bidi-streaming: send encode" + r2.reqType + "(x); recv() -> decode" + r2.respType + "().\n"
+            s = s + "    public " + r2.name + "(): GrpcClientCall {\n"
+            s = s + "        return this._c.bidiStream(" + path + ")\n    }\n\n"
+        }
+        i = i + 1
+    }
+    s = s + "}\n\n"
+    return s
+}
+
+function generate(p: Parser, protoName: string, importBase: string): string {
+    var enumNames: []string = []
+    var i: int = 0
+    while (i < p.enums.length) { enumNames.push(p.enums[i].name); i = i + 1 }
+
+    var out: string = genHeader(protoName, importBase)
+    out = out + "// An empty Buffer (default for bytes fields).\n"
+    out = out + "function _emptyBuf(): Buffer {\n    var e: []any = []\n    return Buffer.fromArray(e)\n}\n\n"
+
+    // enums
+    i = 0
+    while (i < p.enums.length) { out = out + genEnum(p.enums[i]); i = i + 1 }
+
+    // message dataTypes (all first, so encode/decode can forward-reference)
+    i = 0
+    while (i < p.messages.length) { out = out + genMessageType(p.messages[i], enumNames); i = i + 1 }
+
+    // default factories
+    i = 0
+    while (i < p.messages.length) { out = out + genDefault(p.messages[i], enumNames); i = i + 1 }
+
+    // codecs
+    i = 0
+    while (i < p.messages.length) {
+        out = out + genEncode(p.messages[i], enumNames)
+        out = out + genDecode(p.messages[i], enumNames)
+        i = i + 1
+    }
+
+    // services
+    i = 0
+    while (i < p.services.length) { out = out + genService(p.services[i], p.pkg); i = i + 1 }
+
+    return out
+}
+
+// Replace the trailing ".proto" of a path with ".pb.chuks".
+function outputPath(protoPath: string): string {
+    var b: Buffer = Buffer.fromString(protoPath)
+    var n: int = b.length()
+    // strip ".proto" (6 chars) if present
+    if (n > 6) {
+        var tail: []any = []
+        var j: int = n - 6
+        while (j < n) { tail.push(b.getByte(j)); j = j + 1 }
+        if (Buffer.fromArray(tail).toStringUtf8() == ".proto") {
+            var head: []any = []
+            var k: int = 0
+            while (k < n - 6) { head.push(b.getByte(k)); k = k + 1 }
+            return Buffer.fromArray(head).toStringUtf8() + ".pb.chuks"
+        }
+    }
+    return protoPath + ".pb.chuks"
+}
+
+// ─── Entry point ───────────────────────────────────────────────────────────
+
+var args: []string = os.args()
+var protoPath: string = ""
+var importBase: string = "../src"
+
+// Find the .proto argument; an optional extra arg overrides importBase.
+var ai: int = 0
+while (ai < args.length) {
+    var a: string = args[ai]
+    var ab: Buffer = Buffer.fromString(a)
+    var an: int = ab.length()
+    if (an > 6) {
+        var t: []any = []
+        var jj: int = an - 6
+        while (jj < an) { t.push(ab.getByte(jj)); jj = jj + 1 }
+        if (Buffer.fromArray(t).toStringUtf8() == ".proto") { protoPath = a }
+    }
+    ai = ai + 1
+}
+
+// A non-.proto, non-flag trailing arg becomes importBase.
+if (args.length >= 2) {
+    var lastArg: string = args[args.length - 1]
+    if (lastArg != protoPath) { importBase = lastArg }
+}
+
+if (protoPath == "") {
+    println("usage: chuks run tools/protogen.chuks <file.proto> [importBase]")
+    os.exit(1)
+}
+
+var content: string = fs.readFile(protoPath)
+var toks: []string = tokenize(Buffer.fromString(content))
+var parser: Parser = new Parser(toks)
+parser.parse()
+
+var code: string = generate(parser, protoPath, importBase)
+var outPath: string = outputPath(protoPath)
+fs.writeFile(outPath, code)
+println("protogen: wrote " + outPath + " (" + string(parser.messages.length) + " messages, " + string(parser.enums.length) + " enums, " + string(parser.services.length) + " services)")

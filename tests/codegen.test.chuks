@@ -1,0 +1,150 @@
+// M7 — protogen codegen: round-trip + typed-client e2e.
+//
+// Validates the output of tools/protogen.chuks (tests/demo.pb.chuks):
+//   • full-message encode/decode round-trip (scalars, enum, nested, repeated)
+//   • default-value omission + repeated packed/non-packed handling
+//   • the generated DemoClient against a live GrpcServer over the loopback
+
+import { Buffer } from "std/buffer"
+import { GrpcServer, GrpcRequest, GrpcResponse, GrpcClient, grpcOk } from "../src/index.chuks"
+import {
+    AllTypes, Inner, Color_RED, Color_GREEN, Color_BLUE,
+    defaultAllTypes, defaultInner,
+    encodeAllTypes, decodeAllTypes, encodeInner, decodeInner,
+    DemoClient, Demo_Unary_PATH
+} from "./demo.pb.chuks"
+
+var passed: int = 0
+var failed: int = 0
+
+function check(name: string, cond: bool): void {
+    if (cond) { passed = passed + 1; println("  ok   " + name) }
+    else { failed = failed + 1; println("  FAIL " + name) }
+}
+
+// ── Test 1: full round-trip of every field kind ─────────────────────────────
+function buildSample(): AllTypes {
+    var inner: Inner = { label: "core", weight: 7 }
+    var i1: Inner = { label: "a", weight: 1 }
+    var i2: Inner = { label: "b", weight: 2 }
+    var blob: Buffer = Buffer.fromArray([222, 173, 190, 239])   // de ad be ef
+    var nums: []int = [3, 270, 86942]
+    var tags: []string = ["x", "yy", "zzz"]
+    var items: []Inner = [i1, i2]
+    var palette: []int = [Color_RED, Color_GREEN, Color_BLUE]
+    var m: AllTypes = {
+        name: "hello", i32: -5, i64: 9000000000, u32: 4000000000, s32: -12345,
+        flag: true, f: 1.5, d: 2.5, fx32: 123456, sfx32: -987654,
+        blob: blob, color: Color_GREEN, inner: inner,
+        nums: nums, tags: tags, items: items, palette: palette
+    }
+    return m
+}
+
+var sample: AllTypes = buildSample()
+var wire: Buffer = encodeAllTypes(sample)
+var back: AllTypes = decodeAllTypes(wire)
+
+check("name", back.name == "hello")
+check("i32 (negative)", back.i32 == -5)
+check("i64 (large)", back.i64 == 9000000000)
+check("u32", back.u32 == 4000000000)
+check("s32 (zigzag negative)", back.s32 == -12345)
+check("flag", back.flag == true)
+check("f (float)", back.f == 1.5)
+check("d (double)", back.d == 2.5)
+check("fx32 (fixed32)", back.fx32 == 123456)
+check("sfx32 (sfixed32 negative)", back.sfx32 == -987654)
+check("blob len", back.blob.length() == 4)
+check("blob[1]", back.blob.getByte(1) == 173)
+check("color (enum)", back.color == Color_GREEN)
+check("inner.label", back.inner.label == "core")
+check("inner.weight", back.inner.weight == 7)
+check("nums packed len", back.nums.length == 3)
+check("nums[2]", back.nums[2] == 86942)
+check("tags len", back.tags.length == 3)
+check("tags[2]", back.tags[2] == "zzz")
+check("items len", back.items.length == 2)
+check("items[1].label", back.items[1].label == "b")
+check("palette packed enum len", back.palette.length == 3)
+check("palette[2]", back.palette[2] == Color_BLUE)
+
+// ── Test 2: defaults omitted, empties stay empty ────────────────────────────
+var empty: AllTypes = defaultAllTypes()
+var emptyWire: Buffer = encodeAllTypes(empty)
+check("default message encodes to 0 bytes", emptyWire.length() == 0)
+var emptyBack: AllTypes = decodeAllTypes(emptyWire)
+check("default name empty", emptyBack.name == "")
+check("default nums empty", emptyBack.nums.length == 0)
+check("default inner defaulted", emptyBack.inner.label == "")
+
+// ── Test 3: standalone Inner codec ──────────────────────────────────────────
+var inOnly: Inner = { label: "solo", weight: 42 }
+var inBack: Inner = decodeInner(encodeInner(inOnly))
+check("inner solo round-trip", inBack.label == "solo" && inBack.weight == 42)
+
+// ── Test 4: typed DemoClient over a live server ─────────────────────────────
+// Server doubles every Inner weight and uppercases name via prefix.
+function unaryHandler(req: GrpcRequest): GrpcResponse {
+    var m: AllTypes = decodeAllTypes(req.data)
+    var reInner: Inner = { label: m.inner.label, weight: m.inner.weight * 2 }
+    var reply: AllTypes = defaultAllTypes()
+    reply.name = "got:" + m.name
+    reply.i32 = m.i32 + 1
+    reply.inner = reInner
+    reply.nums = m.nums
+    return grpcOk(encodeAllTypes(reply))
+}
+
+async function runServer(srv: GrpcServer): Task<void> {
+    srv.serveOnce()
+}
+
+function portOf(addr: string): int {
+    var b: Buffer = Buffer.fromString(addr)
+    var n: int = b.length()
+    var colon: int = -1
+    var i: int = 0
+    while (i < n) {
+        if (b.getByte(i) == 58) { colon = i }
+        i = i + 1
+    }
+    var val: int = 0
+    var j: int = colon + 1
+    while (j < n) {
+        var c: int = b.getByte(j)
+        if (c >= 48 && c <= 57) { val = val * 10 + (c - 48) }
+        j = j + 1
+    }
+    return val
+}
+
+var srv: GrpcServer = new GrpcServer("127.0.0.1", 0)
+srv.register(Demo_Unary_PATH, unaryHandler)
+var srvPort: int = portOf(srv.addr())
+var t: Task<void> = spawn runServer(srv)
+
+var conn: GrpcClient = new GrpcClient("127.0.0.1", srvPort)
+var stub: DemoClient = new DemoClient(conn)
+
+var reqInner: Inner = { label: "node", weight: 5 }
+var reqNums: []int = [10, 20, 30]
+var req: AllTypes = defaultAllTypes()
+req.name = "world"
+req.i32 = 41
+req.inner = reqInner
+req.nums = reqNums
+
+var resp: AllTypes = stub.Unary(req)
+check("client unary name", resp.name == "got:world")
+check("client unary i32", resp.i32 == 42)
+check("client unary inner doubled", resp.inner.weight == 10)
+check("client unary inner label", resp.inner.label == "node")
+check("client unary nums echoed", resp.nums.length == 3 && resp.nums[1] == 20)
+
+conn.close()
+await t
+
+println("")
+println("codegen: " + string(passed) + " passed, " + string(failed) + " failed")
+if (failed > 0) { throw "codegen tests failed" }
