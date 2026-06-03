@@ -1,0 +1,74 @@
+// Standalone gRPC server driven by the grpcurl interop harness
+// (tests/interop/run.sh). It exercises the real gRPC wire protocol over h2c:
+//   • unary            /echo.Echo/Say   -> "hello, <name>"
+//   • server-streaming /echo.Echo/Count -> "<name>0", "<name>1", "<name>2"
+//   • rich-error unary /echo.Echo/Fail  -> INVALID_ARGUMENT + google.rpc detail
+//   • server reflection (list_services) for `grpcurl ... list`
+//
+// It binds an ephemeral port, prints "INTEROP_ADDR=<host:port>" on a line by
+// itself, then serves until killed by the harness.
+
+import { Buffer } from "std/buffer"
+import {
+    GrpcServer, GrpcRequest, GrpcResponse, GrpcServerStream,
+    grpcOk, grpcErrorWithDetails, mkErrorDetail, ErrorDetail,
+    ReflectionService, registerReflectionService,
+    STATUS_INVALID_ARGUMENT
+} from "../../src/index.chuks"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../../src/protobuf.chuks"
+
+// EchoRequest  { string name  = 1; }
+// EchoResponse { string reply = 1; }
+
+function decodeName(data: Buffer): string {
+    var r: ProtoReader = new ProtoReader(data)
+    var out: string = ""
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 1 && tag.wireType == PB_LEN) {
+            out = r.readString()
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return out
+}
+
+function encodeReply(reply: string): Buffer {
+    var w: ProtoWriter = new ProtoWriter()
+    w.writeString(1, reply)
+    return w.toBuffer()
+}
+
+function sayHandler(req: GrpcRequest): GrpcResponse {
+    var name: string = decodeName(req.data)
+    return grpcOk(encodeReply("hello, " + name))
+}
+
+function countHandler(req: GrpcRequest, stream: GrpcServerStream): void {
+    var name: string = decodeName(req.data)
+    var i: int = 0
+    while (i < 3) {
+        stream.send(encodeReply(name + string(i)))
+        i = i + 1
+    }
+}
+
+function failHandler(req: GrpcRequest): GrpcResponse {
+    var info: ProtoWriter = new ProtoWriter()
+    info.writeString(1, "OUT_OF_RANGE")
+    var det: []ErrorDetail = [mkErrorDetail("type.googleapis.com/google.rpc.ErrorInfo", info.toBuffer())]
+    return grpcErrorWithDetails(STATUS_INVALID_ARGUMENT, "interop failure", det)
+}
+
+var srv: GrpcServer = new GrpcServer("127.0.0.1", 0)
+srv.register("/echo.Echo/Say", sayHandler)
+srv.registerServerStream("/echo.Echo/Count", countHandler)
+srv.register("/echo.Echo/Fail", failHandler)
+
+var refl: ReflectionService = new ReflectionService()
+refl.addServerServices(srv)
+registerReflectionService(srv, refl)
+
+println("INTEROP_ADDR=" + srv.addr())
+srv.serve()

@@ -1,0 +1,22 @@
+// Proto used by the grpcurl interop harness (tests/interop/run.sh) to invoke
+// the chuks_grpc server over the real gRPC wire protocol.
+syntax = "proto3";
+
+package echo;
+
+service Echo {
+  // Unary: Say(name) -> "hello, <name>".
+  rpc Say (EchoRequest) returns (EchoResponse);
+  // Server-streaming: Count(name) -> name0, name1, name2.
+  rpc Count (EchoRequest) returns (stream EchoResponse);
+  // Unary that always fails with a rich-error detail (google.rpc.Status details).
+  rpc Fail (EchoRequest) returns (EchoResponse);
+}
+
+message EchoRequest {
+  string name = 1;
+}
+
+message EchoResponse {
+  string reply = 1;
+}
