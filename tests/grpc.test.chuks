@@ -10,7 +10,7 @@ import {
     GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
     GrpcServerStream, GrpcClientCall,
     Metadata, metadataFromHeaders,
-    grpcOk, grpcError,
+    grpcOk, grpcError, grpcErrorWithDetails, mkErrorDetail, ErrorDetail,
     RetryPolicy, defaultRetryPolicy,
     GrpcChannel, Endpoint, mkEndpoint, resolveStatic, LB_PICK_FIRST, LB_ROUND_ROBIN,
     HealthService, HealthClient, registerHealthService,
@@ -210,7 +210,7 @@ function bangRequest(method: string, message: Buffer, md: Metadata, next: any): 
 // Client unary interceptor that wraps the reply body in "wrapped:...".
 function wrapReply(method: string, message: Buffer, md: Metadata, next: any): GrpcReply {
     var rep: GrpcReply = next(method, message, md)
-    var out: GrpcReply = { data: encodeName("wrapped:" + decodeName(rep.data)), status: rep.status, message: rep.message, headers: rep.headers, trailers: rep.trailers }
+    var out: GrpcReply = { data: encodeName("wrapped:" + decodeName(rep.data)), status: rep.status, message: rep.message, headers: rep.headers, trailers: rep.trailers, details: rep.details }
     return out
 }
 
@@ -1197,6 +1197,29 @@ function statsFailHandler(req: GrpcRequest): GrpcResponse {
     return grpcError(STATUS_INVALID_ARGUMENT, "nope")
 }
 
+// ── Rich error model (M18) ──────────────────────────────────────────────────
+
+// Unary handler that fails with a single structured error detail.
+function detailHandler(req: GrpcRequest): GrpcResponse {
+    var info = new ProtoWriter()
+    info.writeString(1, "OUT_OF_RANGE")
+    var det: []ErrorDetail = [mkErrorDetail("type.googleapis.com/google.rpc.ErrorInfo", info.toBuffer())]
+    return grpcErrorWithDetails(STATUS_INVALID_ARGUMENT, "bad input", det)
+}
+
+// Unary handler that fails with two structured error details.
+function multiDetailHandler(req: GrpcRequest): GrpcResponse {
+    var a = new ProtoWriter()
+    a.writeString(1, "reason-a")
+    var b = new ProtoWriter()
+    b.writeString(1, "reason-b")
+    var det: []ErrorDetail = [
+        mkErrorDetail("type.googleapis.com/google.rpc.BadRequest", a.toBuffer()),
+        mkErrorDetail("type.googleapis.com/google.rpc.RetryInfo", b.toBuffer())
+    ]
+    return grpcErrorWithDetails(STATUS_UNAVAILABLE, "two details", det)
+}
+
 // 43 — a server stats handler observes every completed unary RPC
 try {
     var srv43: GrpcServer = new GrpcServer("127.0.0.1", 0)
@@ -1311,6 +1334,72 @@ try {
     await t46
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 46 server stream stats — " + string(e)) }
+
+// ── Rich error model (M18) ──────────────────────────────────────────────────
+
+// 47 — a server error with a single rich detail is decoded back by the client
+try {
+    var srv47: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv47.register("/echo.Echo/Fail", detailHandler)
+    var port47: int = portOf(srv47.addr())
+    var t47: Task<void> = spawn runServer(srv47)
+
+    var client47: GrpcClient = new GrpcClient("127.0.0.1", port47)
+    var rep47: GrpcReply = client47.unary("/echo.Echo/Fail", encodeName("x"))
+    test.assertEqual(rep47.status, STATUS_INVALID_ARGUMENT)
+    test.assertEqual(rep47.message, "bad input")
+    test.assertEqual(rep47.details.length, 1)
+    if (rep47.details.length == 1) {
+        test.assertEqual(rep47.details[0].typeUrl, "type.googleapis.com/google.rpc.ErrorInfo")
+        var dr47: ProtoReader = new ProtoReader(rep47.details[0].value)
+        var tg47: ProtoTag = dr47.readTag()
+        test.assertEqual(tg47.field, 1)
+        test.assertEqual(dr47.readString(), "OUT_OF_RANGE")
+    }
+    client47.close()
+    await t47
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 47 rich error single detail — " + string(e)) }
+
+// 48 — a successful reply carries no details
+try {
+    var srv48: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv48.register("/echo.Echo/Say", sayHandler)
+    var port48: int = portOf(srv48.addr())
+    var t48: Task<void> = spawn runServer(srv48)
+
+    var client48: GrpcClient = new GrpcClient("127.0.0.1", port48)
+    var rep48: GrpcReply = client48.unary("/echo.Echo/Say", encodeName("hi"))
+    test.assertEqual(rep48.status, STATUS_OK)
+    test.assertEqual(rep48.details.length, 0)
+    client48.close()
+    await t48
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 48 success has no details — " + string(e)) }
+
+// 49 — multiple details round-trip in order
+try {
+    var srv49: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv49.register("/echo.Echo/Multi", multiDetailHandler)
+    var port49: int = portOf(srv49.addr())
+    var t49: Task<void> = spawn runServer(srv49)
+
+    var client49: GrpcClient = new GrpcClient("127.0.0.1", port49)
+    var rep49: GrpcReply = client49.unary("/echo.Echo/Multi", encodeName("y"))
+    test.assertEqual(rep49.status, STATUS_UNAVAILABLE)
+    test.assertEqual(rep49.details.length, 2)
+    if (rep49.details.length == 2) {
+        test.assertEqual(rep49.details[0].typeUrl, "type.googleapis.com/google.rpc.BadRequest")
+        test.assertEqual(rep49.details[1].typeUrl, "type.googleapis.com/google.rpc.RetryInfo")
+        var dr49: ProtoReader = new ProtoReader(rep49.details[1].value)
+        var tg49: ProtoTag = dr49.readTag()
+        test.assertEqual(tg49.field, 1)
+        test.assertEqual(dr49.readString(), "reason-b")
+    }
+    client49.close()
+    await t49
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 49 multiple details round-trip — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

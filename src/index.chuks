@@ -22,6 +22,7 @@
 import { TcpConnection, TcpServer, TlsConnection, TlsServer } from "std/net"
 import { Buffer } from "std/buffer"
 import { compress } from "std/compress"
+import { base64 } from "std/base64"
 import { time } from "std/time"
 import { HpackHeader } from "./hpack.chuks"
 import { GrpcMessage } from "./framing.chuks"
@@ -65,6 +66,16 @@ export dataType GrpcResponse {
     data: Buffer;          // raw response message bytes (will be gRPC-framed)
     status: int;           // grpc-status; use STATUS_OK on success
     message: string;       // grpc-message (human-readable, on error)
+    details: []ErrorDetail; // structured error details (rich error model); empty on success
+}
+
+// A single google.protobuf.Any-encoded error detail: a type URL identifying the
+// detail message plus its serialized protobuf bytes. Several of these make up
+// the "rich error model" — structured, machine-readable error information that
+// travels in the grpc-status-details-bin trailer beside the status code/message.
+export dataType ErrorDetail {
+    typeUrl: string;       // e.g. "type.googleapis.com/google.rpc.ErrorInfo"
+    value: Buffer;         // the serialized detail message bytes
 }
 
 // A reply received by the client after a unary call.
@@ -74,6 +85,7 @@ export dataType GrpcReply {
     message: string;
     headers: []HpackHeader;    // initial response metadata (server HEADERS)
     trailers: []HpackHeader;   // trailing response metadata (server trailers)
+    details: []ErrorDetail;    // decoded rich-error details (empty when none sent)
 }
 
 // ─── Retry policy ─────────────────────────────────────────────────────────
@@ -115,15 +127,32 @@ function _isRetryable(policy: RetryPolicy, status: int): bool {
 
 // Build a successful response from raw message bytes.
 export function grpcOk(data: Buffer): GrpcResponse {
-    var r: GrpcResponse = { data: data, status: STATUS_OK, message: "" }
+    var nodet: []ErrorDetail = []
+    var r: GrpcResponse = { data: data, status: STATUS_OK, message: "", details: nodet }
     return r
 }
 
 // Build an error response with a status code and message (no body).
 export function grpcError(status: int, message: string): GrpcResponse {
     var none: []any = []
-    var r: GrpcResponse = { data: Buffer.fromArray(none), status: status, message: message }
+    var nodet: []ErrorDetail = []
+    var r: GrpcResponse = { data: Buffer.fromArray(none), status: status, message: message, details: nodet }
     return r
+}
+
+// Build an error response carrying structured rich-error details. The details
+// are serialized as a google.rpc.Status message and sent in the
+// grpc-status-details-bin trailer; the client reads them back via GrpcReply.details.
+export function grpcErrorWithDetails(status: int, message: string, details: []ErrorDetail): GrpcResponse {
+    var none: []any = []
+    var r: GrpcResponse = { data: Buffer.fromArray(none), status: status, message: message, details: details }
+    return r
+}
+
+// Build a single rich-error detail from a type URL and its serialized bytes.
+export function mkErrorDetail(typeUrl: string, value: Buffer): ErrorDetail {
+    var d: ErrorDetail = { typeUrl: typeUrl, value: value }
+    return d
 }
 
 // ─── Metadata ───────────────────────────────────────────────────────────────
@@ -258,10 +287,114 @@ function emptyHeaders(): []HpackHeader {
     return e
 }
 
-// Construct a client reply with response metadata.
+// Construct a client reply with response metadata. If a grpc-status-details-bin
+// trailer is present it is base64-decoded and parsed into structured details.
 function mkReply(data: Buffer, status: int, message: string, headers: []HpackHeader, trailers: []HpackHeader): GrpcReply {
-    var r: GrpcReply = { data: data, status: status, message: message, headers: headers, trailers: trailers }
+    var det: []ErrorDetail = []
+    var bin: string = findHeader(trailers, "grpc-status-details-bin")
+    if (bin.length > 0) {
+        det = _decodeStatusDetails(_b64BinDecode(bin))
+    }
+    var r: GrpcReply = { data: data, status: status, message: message, headers: headers, trailers: trailers, details: det }
     return r
+}
+
+// ─── Rich error model (google.rpc.Status / grpc-status-details-bin) ─────────
+//
+// gRPC carries structured error details in a `grpc-status-details-bin` trailer.
+// The value is a serialized google.rpc.Status message, base64-encoded (the
+// `-bin` suffix tells the transport the value is binary). google.rpc.Status is:
+//   field 1: code     (int32)
+//   field 2: message  (string)
+//   field 3: details  (repeated google.protobuf.Any)
+// and each google.protobuf.Any is:
+//   field 1: type_url (string)
+//   field 2: value    (bytes)
+
+// Serialize status code + message + details into a google.rpc.Status message.
+function _encodeStatusDetails(code: int, message: string, details: []ErrorDetail): Buffer {
+    var w = new ProtoWriter()
+    w.writeInt32(1, code)
+    w.writeString(2, message)
+    var i: int = 0
+    while (i < details.length) {
+        var anyw = new ProtoWriter()
+        anyw.writeString(1, details[i].typeUrl)
+        anyw.writeBytes(2, details[i].value)
+        w.writeMessage(3, anyw)
+        i = i + 1
+    }
+    return w.toBuffer()
+}
+
+// Parse a serialized google.rpc.Status message into its detail list.
+function _decodeStatusDetails(data: Buffer): []ErrorDetail {
+    var out: []ErrorDetail = []
+    var r = new ProtoReader(data)
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 3 && tag.wireType == PB_LEN) {
+            var any: ProtoReader = r.readMessage()
+            var typeUrl: string = ""
+            var value: Buffer = emptyBuf()
+            while (any.hasMore()) {
+                var at: ProtoTag = any.readTag()
+                if (at.field == 1 && at.wireType == PB_LEN) {
+                    typeUrl = any.readString()
+                } else if (at.field == 2 && at.wireType == PB_LEN) {
+                    value = any.readBytes()
+                } else {
+                    any.skip(at.wireType)
+                }
+            }
+            var d: ErrorDetail = { typeUrl: typeUrl, value: value }
+            out.push(d)
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return out
+}
+
+// Encode a status (code/message/details) as the base64 trailer value. The
+// padding ('=') is stripped to match gRPC's RawStdEncoding for binary metadata,
+// keeping the trailer interoperable with real gRPC servers/clients (grpcurl, Go).
+function _encodeStatusDetailsBin(code: int, message: string, details: []ErrorDetail): string {
+    var raw: Buffer = _encodeStatusDetails(code, message, details)
+    return _stripB64Pad(base64.encodeBuffer(raw))
+}
+
+// Decode a base64 (RawStdEncoding, no padding) trailer value into a Buffer.
+function _b64BinDecode(s: string): Buffer {
+    return base64.decodeToBuffer(_padB64(s))
+}
+
+// Remove trailing '=' padding from a base64 string.
+function _stripB64Pad(s: string): string {
+    var b: Buffer = Buffer.fromString(s)
+    var end: int = b.length()
+    while (end > 0 && b.getByte(end - 1) == 61) {
+        end = end - 1
+    }
+    var out: []any = []
+    var i: int = 0
+    while (i < end) {
+        out.push(b.getByte(i))
+        i = i + 1
+    }
+    return Buffer.fromArray(out).toStringUtf8()
+}
+
+// Re-add '=' padding so a RawStdEncoding base64 string can be standard-decoded.
+function _padB64(s: string): string {
+    var rem: int = s.length % 4
+    var out: string = s
+    if (rem == 2) {
+        out = out + "=="
+    } else if (rem == 3) {
+        out = out + "="
+    }
+    return out
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
@@ -460,6 +593,7 @@ export class GrpcServerStream {
     var _respEncoding: string
     var _peerCN: string
     var _finishStatus: int   // terminal grpc-status sent by finish(); STATUS_OK until then
+    var _statusDetailsBin: string  // base64 grpc-status-details-bin trailer value ("" = none)
 
     constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool, peerCN: string) {
         this._st = st
@@ -467,6 +601,7 @@ export class GrpcServerStream {
         this._meta = meta
         this._peerCN = peerCN
         this._finishStatus = STATUS_OK
+        this._statusDetailsBin = ""
         this._headersSent = false
         this._deadlineMs = deadlineFromMeta(meta)
         this._cancelObserved = false
@@ -615,11 +750,27 @@ export class GrpcServerStream {
         return this._finishStatus
     }
 
+    // Attach structured rich-error details to be sent alongside the terminal
+    // status. The details are serialized as a google.rpc.Status message and
+    // emitted (base64-encoded) in the grpc-status-details-bin trailer when
+    // finish() is called. Call this before finish(); a later status/message is
+    // taken from finish() itself. Passing an empty list clears any details.
+    public setStatusDetails(status: int, message: string, details: []ErrorDetail): void {
+        if (details.length == 0) {
+            this._statusDetailsBin = ""
+            return
+        }
+        this._statusDetailsBin = _encodeStatusDetailsBin(status, message, details)
+    }
+
     // Finish the RPC with a status and message (sends trailers, ends stream).
     public finish(status: int, message: string): void {
         this._finishStatus = status
         this._ensureHeaders()
         var trailers: []HpackHeader = [hdr("grpc-status", string(status)), hdr("grpc-message", message)]
+        if (this._statusDetailsBin.length > 0) {
+            trailers.push(hdr("grpc-status-details-bin", this._statusDetailsBin))
+        }
         var i: int = 0
         while (i < this._respTrailers.length) {
             trailers.push(this._respTrailers[i])
@@ -846,6 +997,7 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
             }
             var resp: GrpcResponse = _runServerUnary(srv._unaryInterceptors, 0, req, unaryTerminal)
             if (resp.status != STATUS_OK) {
+                ss.setStatusDetails(resp.status, resp.message, resp.details)
                 ss.finish(resp.status, resp.message)
             } else {
                 ss.send(resp.data)
