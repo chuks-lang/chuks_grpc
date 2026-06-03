@@ -50,6 +50,27 @@ export const STATUS_UNAVAILABLE: int = 14
 export const STATUS_DATA_LOSS: int = 15
 export const STATUS_UNAUTHENTICATED: int = 16
 
+// Default maximum size (bytes) of a single inbound message accepted on either
+// side before it is rejected with RESOURCE_EXHAUSTED. Mirrors the canonical
+// gRPC default of 4 MiB. Override per server/client via setMaxRecvMessageBytes;
+// pass 0 to disable the limit entirely.
+export const DEFAULT_MAX_RECV_MESSAGE_BYTES: int = 4194304
+
+// Sentinel prefix used internally so a too-large inbound message thrown from a
+// server-side recv() can be re-mapped to STATUS_RESOURCE_EXHAUSTED by the
+// dispatcher (instead of the generic STATUS_INTERNAL).
+const _ERR_RECV_TOO_LARGE: string = "grpc: received message larger than max ("
+
+    // Build the human-readable "message too large" string shared by both ends.
+    function _recvTooLargeMsg(got: int, limit: int): string {
+        return _ERR_RECV_TOO_LARGE + string(got) + " vs. " + string(limit) + ")"
+}
+
+// True when an error string came from the too-large-message guardrail.
+function _isRecvTooLarge(msg: string): bool {
+    return msg.length >= _ERR_RECV_TOO_LARGE.length && msg.startsWith(_ERR_RECV_TOO_LARGE)
+}
+
 // ─── Public message types ──────────────────────────────────────────────────
 
 // A decoded unary request handed to a server handler.
@@ -303,7 +324,7 @@ function mkReply(data: Buffer, status: int, message: string, headers: []HpackHea
 //
 // gRPC carries structured error details in a `grpc-status-details-bin` trailer.
 // The value is a serialized google.rpc.Status message, base64-encoded (the
-// `-bin` suffix tells the transport the value is binary). google.rpc.Status is:
+    // `-bin` suffix tells the transport the value is binary). google.rpc.Status is:
 //   field 1: code     (int32)
 //   field 2: message  (string)
 //   field 3: details  (repeated google.protobuf.Any)
@@ -491,7 +512,7 @@ function requestHeadersT(method: string, authority: string, timeoutMs: int): []H
         hdr(":path", method),
         hdr(":authority", authority),
         hdr("content-type", "application/grpc"),
-        hdr("te", "trailers")
+        hdr("te", "trailers"),
     ]
     if (timeoutMs > 0) {
         hs.push(hdr("grpc-timeout", encodeTimeout(timeoutMs)))
@@ -594,14 +615,16 @@ export class GrpcServerStream {
     var _peerCN: string
     var _finishStatus: int   // terminal grpc-status sent by finish(); STATUS_OK until then
     var _statusDetailsBin: string  // base64 grpc-status-details-bin trailer value ("" = none)
+    var _maxRecvBytes: int   // reject inbound messages larger than this (0 = unlimited)
 
-    constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool, peerCN: string) {
+    constructor(st: Http2Stream, method: string, meta: []HpackHeader, serverCompress: bool, peerCN: string, maxRecvBytes: int) {
         this._st = st
         this._method = method
         this._meta = meta
         this._peerCN = peerCN
         this._finishStatus = STATUS_OK
         this._statusDetailsBin = ""
+        this._maxRecvBytes = maxRecvBytes
         this._headersSent = false
         this._deadlineMs = deadlineFromMeta(meta)
         this._cancelObserved = false
@@ -712,10 +735,16 @@ export class GrpcServerStream {
     }
 
     // Receive the next request message, or null once the client half-closes.
+    // Enforces the configured max inbound message size: an oversized message is
+    // rejected by throwing, which the dispatcher maps to RESOURCE_EXHAUSTED.
     public recv(): Buffer? {
         var m: GrpcMessage? = this._st.recv()
         if (m != null) {
-            return decodeMessage(m)
+            var data: Buffer = decodeMessage(m)
+            if (this._maxRecvBytes > 0 && data.length() > this._maxRecvBytes) {
+                throw _recvTooLargeMsg(data.length(), this._maxRecvBytes)
+            }
+            return data
         }
         return null
     }
@@ -744,7 +773,7 @@ export class GrpcServerStream {
     }
 
     // The terminal grpc-status this stream finished with (STATUS_OK until
-    // finish() is called). Used by the server stats hooks (M17) to report the
+        // finish() is called). Used by the server stats hooks (M17) to report the
     // outcome of streaming RPCs.
     public finishStatus(): int {
         return this._finishStatus
@@ -808,6 +837,7 @@ export class GrpcServer {
     var _statsHandlers: []any       // function(stats: RpcStats): void — fired per finished RPC
     var _kaTime: int                // keepalive ping interval (ms; 0 = disabled)
     var _kaTimeout: int             // keepalive ack timeout (ms)
+    var _maxRecvBytes: int          // max inbound message size (bytes; 0 = unlimited)
 
     // Bind a listener immediately. Pass port 0 for an OS-assigned port and read
     // it back via addr(). Provide tlsOptions to serve over TLS/mTLS instead of
@@ -827,6 +857,7 @@ export class GrpcServer {
         this._statsHandlers = []
         this._kaTime = 0
         this._kaTimeout = 0
+        this._maxRecvBytes = DEFAULT_MAX_RECV_MESSAGE_BYTES
     }
 
     // Opt in to response compression. When enabled, responses are gzip-compressed
@@ -842,6 +873,15 @@ export class GrpcServer {
     public enableKeepalive(timeMs: int, timeoutMs: int): void {
         this._kaTime = timeMs
         this._kaTimeout = timeoutMs
+    }
+
+    // Cap the size (bytes) of any single inbound request message. A larger
+    // message is rejected with STATUS_RESOURCE_EXHAUSTED before the handler runs
+    // (or, for streaming RPCs, when recv() reads it), protecting the server from
+    // unbounded memory use. Defaults to DEFAULT_MAX_RECV_MESSAGE_BYTES (4 MiB);
+    // pass 0 to disable the limit. Set before serve().
+    public setMaxRecvMessageBytes(maxBytes: int): void {
+        this._maxRecvBytes = maxBytes
     }
 
     // Register a unary server interceptor. Interceptors run in registration
@@ -970,7 +1010,7 @@ async function _serveConn(srv: GrpcServer, conn: TcpConnection): Task<void> {
 // Dispatch a single accepted stream to its registered handler.
 async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): Task<void> {
     var path: string = findHeader(st.initialMeta, ":path")
-    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta, srv._compress, peerCN)
+    var ss: GrpcServerStream = new GrpcServerStream(st, path, st.initialMeta, srv._compress, peerCN, srv._maxRecvBytes)
 
     if (!srv._handlers.has(path)) {
         ss.finish(STATUS_UNIMPLEMENTED, "method not found: " + path)
@@ -1038,8 +1078,14 @@ async function _serveStream(srv: GrpcServer, st: Http2Stream, peerCN: string): T
             _statStatus = ss.finishStatus()
         }
     } catch (e) {
-        ss.finish(STATUS_INTERNAL, string(e))
-        _statStatus = STATUS_INTERNAL
+        var em: string = string(e)
+        if (_isRecvTooLarge(em)) {
+            ss.finish(STATUS_RESOURCE_EXHAUSTED, em)
+            _statStatus = STATUS_RESOURCE_EXHAUSTED
+        } else {
+            ss.finish(STATUS_INTERNAL, em)
+            _statStatus = STATUS_INTERNAL
+        }
     }
 
     _emitServerStats(srv, path, peerCN, _statStart, _statStatus)
@@ -1059,7 +1105,7 @@ function _emitServerStats(srv: GrpcServer, method: string, peerCN: string, start
         startMs: startMs,
         endMs: endMs,
         durationMs: endMs - startMs,
-        peerCN: peerCN
+        peerCN: peerCN,
     }
     var i: int = 0
     while (i < srv._statsHandlers.length) {
@@ -1227,6 +1273,7 @@ export class GrpcClient {
     var _statsHandlers: []any       // function(stats: RpcStats): void — fired per finished unary call
     var _retryEnabled: bool         // automatic unary retries on/off
     var _retry: RetryPolicy         // active retry policy (default when disabled)
+    var _maxRecvBytes: int          // max inbound message size (bytes; 0 = unlimited)
 
     // Connect over HTTP/2, exchange the preface, and start the multiplexing
     // reader/mux tasks. Without tlsOptions this is cleartext h2c; pass tlsOptions
@@ -1247,6 +1294,7 @@ export class GrpcClient {
         this._statsHandlers = []
         this._retryEnabled = false
         this._retry = defaultRetryPolicy()
+        this._maxRecvBytes = DEFAULT_MAX_RECV_MESSAGE_BYTES
     }
 
     public close(): void {
@@ -1311,6 +1359,14 @@ export class GrpcClient {
         this._retryEnabled = false
     }
 
+    // Cap the size (bytes) of any single inbound response message on unary calls.
+    // A larger reply is rejected with STATUS_RESOURCE_EXHAUSTED instead of being
+    // buffered, protecting the client from unbounded memory use. Defaults to
+    // DEFAULT_MAX_RECV_MESSAGE_BYTES (4 MiB); pass 0 to disable the limit.
+    public setMaxRecvMessageBytes(maxBytes: int): void {
+        this._maxRecvBytes = maxBytes
+    }
+
     // Open a raw stream for `method` (request HEADERS sent, body not yet).
     private _open(method: string): Http2Stream {
         return this._h2.openStream(requestHeaders(method, this._authority))
@@ -1367,7 +1423,7 @@ export class GrpcClient {
             startMs: startMs,
             endMs: endMs,
             durationMs: endMs - startMs,
-            peerCN: ""
+            peerCN: "",
         }
         var i: int = 0
         while (i < this._statsHandlers.length) {
@@ -1424,6 +1480,10 @@ export class GrpcClient {
             if (m != null) {
                 respData = decodeMessage(m)
             }
+            if (this._maxRecvBytes > 0 && respData.length() > this._maxRecvBytes) {
+                st.reset(ERR_CANCEL)
+                return mkReply(emptyBuf(), STATUS_RESOURCE_EXHAUSTED, _recvTooLargeMsg(respData.length(), this._maxRecvBytes), emptyHeaders(), emptyHeaders())
+            }
             // Drain any trailing messages so the stream reaches its terminal state.
             var extra: GrpcMessage? = st.recv()
             while (extra != null) {
@@ -1438,6 +1498,10 @@ export class GrpcClient {
             var dm: GrpcMessage? = st.tryRecv()
             if (dm != null) {
                 got = decodeMessage(dm)
+                if (this._maxRecvBytes > 0 && got.length() > this._maxRecvBytes) {
+                    st.reset(ERR_CANCEL)
+                    return mkReply(emptyBuf(), STATUS_RESOURCE_EXHAUSTED, _recvTooLargeMsg(got.length(), this._maxRecvBytes), emptyHeaders(), emptyHeaders())
+                }
             }
             var de: Http2StreamEnd? = st.tryResult()
             if (de != null) {

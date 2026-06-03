@@ -18,7 +18,7 @@ import {
     ReflectionService, ReflectionClient, registerReflectionService,
     RpcStats,
     STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED,
-    STATUS_UNAVAILABLE, STATUS_INVALID_ARGUMENT
+    STATUS_UNAVAILABLE, STATUS_INVALID_ARGUMENT, STATUS_RESOURCE_EXHAUSTED
 } from "../src/index.chuks"
 import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "../src/protobuf.chuks"
 import { tlsSelfSigned } from "std/net"
@@ -1215,7 +1215,7 @@ function multiDetailHandler(req: GrpcRequest): GrpcResponse {
     b.writeString(1, "reason-b")
     var det: []ErrorDetail = [
         mkErrorDetail("type.googleapis.com/google.rpc.BadRequest", a.toBuffer()),
-        mkErrorDetail("type.googleapis.com/google.rpc.RetryInfo", b.toBuffer())
+        mkErrorDetail("type.googleapis.com/google.rpc.RetryInfo", b.toBuffer()),
     ]
     return grpcErrorWithDetails(STATUS_UNAVAILABLE, "two details", det)
 }
@@ -1400,6 +1400,110 @@ try {
     await t49
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 49 multiple details round-trip — " + string(e)) }
+
+// ── Message-size limits / hardening (M19) ───────────────────────────────────
+
+// Build a string of `n` 'a' characters, used to make over-/under-sized messages.
+function repeatA(n: int): string {
+    var s: string = ""
+    var i: int = 0
+    while (i < n) {
+        s = s + "a"
+        i = i + 1
+    }
+    return s
+}
+
+// Unary handler that returns a large (~2 KB) response payload.
+function bigReplyHandler(req: GrpcRequest): GrpcResponse {
+    return grpcOk(encodeName(repeatA(2000)))
+}
+
+// 50 — server rejects an oversized unary request with RESOURCE_EXHAUSTED
+try {
+    var srv50: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv50.setMaxRecvMessageBytes(64)
+    srv50.register("/echo.Echo/Say", sayHandler)
+    var port50: int = portOf(srv50.addr())
+    var t50: Task<void> = spawn runServer(srv50)
+
+    var client50: GrpcClient = new GrpcClient("127.0.0.1", port50)
+    var rep50: GrpcReply = client50.unary("/echo.Echo/Say", encodeName(repeatA(500)))
+    test.assertEqual(rep50.status, STATUS_RESOURCE_EXHAUSTED)
+    client50.close()
+    await t50
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 50 server rejects oversized request — " + string(e)) }
+
+// 51 — a request within the configured server limit still succeeds
+try {
+    var srv51: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv51.setMaxRecvMessageBytes(4096)
+    srv51.register("/echo.Echo/Say", sayHandler)
+    var port51: int = portOf(srv51.addr())
+    var t51: Task<void> = spawn runServer(srv51)
+
+    var client51: GrpcClient = new GrpcClient("127.0.0.1", port51)
+    var rep51: GrpcReply = client51.unary("/echo.Echo/Say", encodeName(repeatA(500)))
+    test.assertEqual(rep51.status, STATUS_OK)
+    test.assertEqual(decodeName(rep51.data), "hello, " + repeatA(500))
+    client51.close()
+    await t51
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 51 within-limit request succeeds — " + string(e)) }
+
+// 52 — client rejects an oversized unary response with RESOURCE_EXHAUSTED
+try {
+    var srv52: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv52.register("/echo.Echo/Big", bigReplyHandler)
+    var port52: int = portOf(srv52.addr())
+    var t52: Task<void> = spawn runServer(srv52)
+
+    var client52: GrpcClient = new GrpcClient("127.0.0.1", port52)
+    client52.setMaxRecvMessageBytes(128)
+    var rep52: GrpcReply = client52.unary("/echo.Echo/Big", encodeName("x"))
+    test.assertEqual(rep52.status, STATUS_RESOURCE_EXHAUSTED)
+    client52.close()
+    await t52
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 52 client rejects oversized response — " + string(e)) }
+
+// 53 — the default client limit accepts a normal (large-but-bounded) response
+try {
+    var srv53: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv53.register("/echo.Echo/Big", bigReplyHandler)
+    var port53: int = portOf(srv53.addr())
+    var t53: Task<void> = spawn runServer(srv53)
+
+    var client53: GrpcClient = new GrpcClient("127.0.0.1", port53)
+    var rep53: GrpcReply = client53.unary("/echo.Echo/Big", encodeName("x"))
+    test.assertEqual(rep53.status, STATUS_OK)
+    test.assertEqual(decodeName(rep53.data), repeatA(2000))
+    client53.close()
+    await t53
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 53 default client limit accepts response — " + string(e)) }
+
+// 54 — the limit is enforced on streaming RPCs too (oversized stream request)
+try {
+    var srv54: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv54.setMaxRecvMessageBytes(64)
+    srv54.registerServerStream("/echo.Echo/Count", countHandler)
+    var port54: int = portOf(srv54.addr())
+    var t54: Task<void> = spawn runServer(srv54)
+
+    var client54: GrpcClient = new GrpcClient("127.0.0.1", port54)
+    var call54: GrpcClientCall = client54.serverStream("/echo.Echo/Count", encodeName(repeatA(500)))
+    var drain54: Buffer? = call54.recv()
+    while (drain54 != null) {
+        drain54 = call54.recv()
+    }
+    var end54: GrpcReply = call54.result()
+    test.assertEqual(end54.status, STATUS_RESOURCE_EXHAUSTED)
+    client54.close()
+    await t54
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 54 streaming oversized request — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")
