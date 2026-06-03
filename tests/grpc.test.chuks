@@ -12,6 +12,9 @@ import {
     Metadata, metadataFromHeaders,
     grpcOk, grpcError,
     RetryPolicy, defaultRetryPolicy,
+    GrpcChannel, Endpoint, mkEndpoint, resolveStatic, LB_PICK_FIRST, LB_ROUND_ROBIN,
+    HealthService, HealthClient, registerHealthService,
+    SERVING_SERVING, SERVING_NOT_SERVING, SERVING_SERVICE_UNKNOWN,
     STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED, STATUS_UNAUTHENTICATED,
     STATUS_UNAVAILABLE, STATUS_INVALID_ARGUMENT
 } from "../src/index.chuks"
@@ -872,6 +875,204 @@ try {
     await t32
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 32 retries disabled by default — " + string(e)) }
+
+// ── Load-balancing & health fixtures (M14/M15) ──────────────────────────────
+// Identity handlers so a load-balanced client can tell which backend served it.
+function id0Handler(req: GrpcRequest): GrpcResponse { return grpcOk(encodeName("id=0")) }
+function id1Handler(req: GrpcRequest): GrpcResponse { return grpcOk(encodeName("id=1")) }
+function id2Handler(req: GrpcRequest): GrpcResponse { return grpcOk(encodeName("id=2")) }
+
+// 33 — static name resolution parses "host:port" lists (with stray whitespace)
+try {
+    var eps33: []Endpoint = resolveStatic("127.0.0.1:1000, 127.0.0.1:2000 ,localhost:3000")
+    test.assertEqual(eps33.length, 3)
+    test.assertEqual(eps33[0].host, "127.0.0.1")
+    test.assertEqual(eps33[0].port, 1000)
+    test.assertEqual(eps33[1].port, 2000)
+    test.assertEqual(eps33[2].host, "localhost")
+    test.assertEqual(eps33[2].port, 3000)
+    // Entries without a port are dropped.
+    var eps33b: []Endpoint = resolveStatic("127.0.0.1,127.0.0.1:7")
+    test.assertEqual(eps33b.length, 1)
+    test.assertEqual(eps33b[0].port, 7)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 33 resolveStatic — " + string(e)) }
+
+// 34 — round-robin spreads calls evenly across three backends
+try {
+    var srvA34: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srvA34.register("/lb.Echo/Id", id0Handler)
+    var pA34: int = portOf(srvA34.addr())
+    var tA34: Task<void> = spawn runServer(srvA34)
+
+    var srvB34: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srvB34.register("/lb.Echo/Id", id1Handler)
+    var pB34: int = portOf(srvB34.addr())
+    var tB34: Task<void> = spawn runServer(srvB34)
+
+    var srvC34: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srvC34.register("/lb.Echo/Id", id2Handler)
+    var pC34: int = portOf(srvC34.addr())
+    var tC34: Task<void> = spawn runServer(srvC34)
+
+    var target34: string = "127.0.0.1:" + string(pA34) + ",127.0.0.1:" + string(pB34) + ",127.0.0.1:" + string(pC34)
+    var ch34: GrpcChannel = new GrpcChannel(target34, LB_ROUND_ROBIN)
+    test.assertEqual(ch34.subchannelCount(), 3)
+    test.assertEqual(ch34.readyCount(), 3)
+
+    var seq34: string = ""
+    var k34: int = 0
+    while (k34 < 6) {
+        var r34: GrpcReply = ch34.unary("/lb.Echo/Id", encodeName("x"))
+        test.assertEqual(r34.status, STATUS_OK)
+        seq34 = seq34 + decodeName(r34.data) + ";"
+        k34 = k34 + 1
+    }
+    test.assertEqual(seq34, "id=0;id=1;id=2;id=0;id=1;id=2;")
+    ch34.close()
+    await tA34
+    await tB34
+    await tC34
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 34 round-robin — " + string(e)) }
+
+// 35 — pick-first routes every call to the first reachable backend
+try {
+    var srvA35: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srvA35.register("/lb.Echo/Id", id0Handler)
+    var pA35: int = portOf(srvA35.addr())
+    var tA35: Task<void> = spawn runServer(srvA35)
+
+    var srvB35: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srvB35.register("/lb.Echo/Id", id1Handler)
+    var pB35: int = portOf(srvB35.addr())
+    var tB35: Task<void> = spawn runServer(srvB35)
+
+    var target35: string = "127.0.0.1:" + string(pA35) + ",127.0.0.1:" + string(pB35)
+    var ch35: GrpcChannel = new GrpcChannel(target35, LB_PICK_FIRST)
+
+    var seq35: string = ""
+    var k35: int = 0
+    while (k35 < 4) {
+        var r35: GrpcReply = ch35.unary("/lb.Echo/Id", encodeName("x"))
+        seq35 = seq35 + decodeName(r35.data) + ";"
+        k35 = k35 + 1
+    }
+    test.assertEqual(seq35, "id=0;id=0;id=0;id=0;")
+    ch35.close()
+    await tA35
+    await tB35
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 35 pick-first — " + string(e)) }
+
+// 36 — health Check reports SERVING for a registered service
+try {
+    var srv36: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    var health36: HealthService = new HealthService()
+    health36.setServing("pkg.Svc")
+    registerHealthService(srv36, health36)
+    var port36: int = portOf(srv36.addr())
+    var t36: Task<void> = spawn runServer(srv36)
+
+    var client36: GrpcClient = new GrpcClient("127.0.0.1", port36)
+    var hc36: HealthClient = new HealthClient(client36)
+    test.assertEqual(hc36.check("pkg.Svc"), SERVING_SERVING)
+    test.assertEqual(hc36.check(""), SERVING_SERVING)          // overall server defaults SERVING
+    test.assertEqual(hc36.check("nope.Svc"), SERVING_SERVICE_UNKNOWN)
+    test.assert(hc36.isServing("pkg.Svc"))
+    client36.close()
+    await t36
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 36 health serving — " + string(e)) }
+
+// 37 — health Check reports NOT_SERVING after the service is taken down
+try {
+    var srv37: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    var health37: HealthService = new HealthService()
+    health37.setNotServing("pkg.Svc")
+    registerHealthService(srv37, health37)
+    var port37: int = portOf(srv37.addr())
+    var t37: Task<void> = spawn runServer(srv37)
+
+    var client37: GrpcClient = new GrpcClient("127.0.0.1", port37)
+    var hc37: HealthClient = new HealthClient(client37)
+    test.assertEqual(hc37.check("pkg.Svc"), SERVING_NOT_SERVING)
+    test.assert(!hc37.isServing("pkg.Svc"))
+    client37.close()
+    await t37
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 37 health not serving — " + string(e)) }
+
+// 38 — health-aware load balancing: refreshHealth drops a NOT_SERVING backend
+try {
+    var srvA38: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    var hA38: HealthService = new HealthService()
+    hA38.setServing("svc")
+    srvA38.register("/lb.Echo/Id", id0Handler)
+    registerHealthService(srvA38, hA38)
+    var pA38: int = portOf(srvA38.addr())
+    var tA38: Task<void> = spawn runServer(srvA38)
+
+    var srvB38: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    var hB38: HealthService = new HealthService()
+    hB38.setNotServing("svc")
+    srvB38.register("/lb.Echo/Id", id1Handler)
+    registerHealthService(srvB38, hB38)
+    var pB38: int = portOf(srvB38.addr())
+    var tB38: Task<void> = spawn runServer(srvB38)
+
+    var srvC38: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    var hC38: HealthService = new HealthService()
+    hC38.setServing("svc")
+    srvC38.register("/lb.Echo/Id", id2Handler)
+    registerHealthService(srvC38, hC38)
+    var pC38: int = portOf(srvC38.addr())
+    var tC38: Task<void> = spawn runServer(srvC38)
+
+    var target38: string = "127.0.0.1:" + string(pA38) + ",127.0.0.1:" + string(pB38) + ",127.0.0.1:" + string(pC38)
+    var ch38: GrpcChannel = new GrpcChannel(target38, LB_ROUND_ROBIN)
+    test.assertEqual(ch38.readyCount(), 3)
+    ch38.refreshHealth("svc")
+    test.assertEqual(ch38.readyCount(), 2)        // middle backend dropped
+
+    var seq38: string = ""
+    var k38: int = 0
+    while (k38 < 4) {
+        var r38: GrpcReply = ch38.unary("/lb.Echo/Id", encodeName("x"))
+        seq38 = seq38 + decodeName(r38.data) + ";"
+        k38 = k38 + 1
+    }
+    test.assertEqual(seq38, "id=0;id=2;id=0;id=2;")   // backend 1 never serves
+    ch38.close()
+    await tA38
+    await tB38
+    await tC38
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 38 health-aware LB — " + string(e)) }
+
+// 39 — a dead endpoint is skipped; the channel still serves from live ones
+try {
+    var dead39: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    var deadPort39: int = portOf(dead39.addr())
+    dead39.close()
+
+    var live39: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    live39.register("/lb.Echo/Id", id0Handler)
+    var livePort39: int = portOf(live39.addr())
+    var t39: Task<void> = spawn runServer(live39)
+
+    var target39: string = "127.0.0.1:" + string(deadPort39) + ",127.0.0.1:" + string(livePort39)
+    var ch39: GrpcChannel = new GrpcChannel(target39, LB_ROUND_ROBIN)
+    test.assertEqual(ch39.endpointCount(), 2)
+    test.assertEqual(ch39.subchannelCount(), 1)     // dead endpoint excluded
+
+    var r39: GrpcReply = ch39.unary("/lb.Echo/Id", encodeName("x"))
+    test.assertEqual(r39.status, STATUS_OK)
+    test.assertEqual(decodeName(r39.data), "id=0")
+    ch39.close()
+    await t39
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 39 dead endpoint skipped — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")

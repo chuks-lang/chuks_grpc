@@ -27,6 +27,7 @@ import { HpackHeader } from "./hpack.chuks"
 import { GrpcMessage } from "./framing.chuks"
 import { ERR_CANCEL } from "./http2.chuks"
 import { Http2Conn, Http2Stream, Http2StreamEnd, findHeader, parseDecimal } from "./transport.chuks"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN, PB_VARINT } from "./protobuf.chuks"
 
 // ─── gRPC status codes (grpc-status trailer) ───────────────────────────────
 
@@ -1241,5 +1242,422 @@ export class GrpcClient {
             call._setDeadline(time.now() + timeoutMs)
         }
         return call
+    }
+}
+
+// ─── Name resolution & client-side load balancing ──────────────────────────
+// A GrpcChannel fronts a set of backend endpoints (resolved from a target) with
+// a load-balancing policy, spreading calls across healthy subchannels. Each
+// subchannel is an independent GrpcClient (one HTTP/2 connection per backend).
+// This is client-side load balancing: there is no external proxy — the channel
+// resolves addresses up front and picks a subchannel per call.
+
+// Load-balancing policies.
+export const LB_PICK_FIRST: int = 0    // always the first ready subchannel (failover only)
+export const LB_ROUND_ROBIN: int = 1   // rotate across ready subchannels per call
+
+// Health checking (M15): standard grpc.health.v1.Health method paths. Declared
+// here so GrpcChannel.refreshHealth (below) can reference the ServingStatus enum.
+export const HEALTH_PATH_CHECK: string = "/grpc.health.v1.Health/Check"
+export const HEALTH_PATH_WATCH: string = "/grpc.health.v1.Health/Watch"
+
+// ServingStatus enum (HealthCheckResponse.status).
+export const SERVING_UNKNOWN: int = 0
+export const SERVING_SERVING: int = 1
+export const SERVING_NOT_SERVING: int = 2
+export const SERVING_SERVICE_UNKNOWN: int = 3
+
+// A resolved backend address.
+export dataType Endpoint {
+    host: string;
+    port: int;
+}
+
+// Build an Endpoint.
+export function mkEndpoint(host: string, port: int): Endpoint {
+    var e: Endpoint = { host: host, port: port }
+    return e
+}
+
+// Static name resolver: parse a comma-separated "host:port,host:port" target
+// into a list of endpoints. Whitespace around entries is tolerated; an entry
+// without a port is skipped. This is the built-in resolver; richer resolvers
+// (DNS, service discovery) can produce []Endpoint and feed a GrpcChannel too.
+export function resolveStatic(target: string): []Endpoint {
+    var out: []Endpoint = []
+    var b: Buffer = Buffer.fromString(target)
+    var n: int = b.length()
+    var hostBytes: []any = []
+    var port: int = 0
+    var sawColon: bool = false
+    var i: int = 0
+    while (i <= n) {
+        var c: int = -1
+        if (i < n) {
+            c = b.getByte(i)
+        }
+        if (i == n || c == 44) {                 // ',' or end of string
+            if (sawColon && hostBytes.length > 0 && port > 0) {
+                out.push(mkEndpoint(Buffer.fromArray(hostBytes).toStringUtf8(), port))
+            }
+            hostBytes = []
+            port = 0
+            sawColon = false
+        } else if (c == 58) {                    // ':'
+            sawColon = true
+        } else if (c == 32 || c == 9) {          // skip spaces/tabs
+            i = i + 1
+            continue
+        } else if (sawColon) {
+            if (c >= 48 && c <= 57) {            // accumulate port digits
+                port = port * 10 + (c - 48)
+            }
+        } else {
+            hostBytes.push(c)                    // accumulate host bytes
+        }
+        i = i + 1
+    }
+    return out
+}
+
+export class GrpcChannel {
+    var _clients: []GrpcClient    // one live subchannel per reachable endpoint
+    var _serving: []bool          // health state per subchannel (true = eligible)
+    var _policy: int
+    var _next: int                // round-robin cursor
+    var _resolved: int            // number of endpoints the resolver produced
+
+    // Resolve `target` ("host:port,host:port"), dial every endpoint, and load
+    // balance calls across the reachable ones using `policy`. Endpoints that
+    // fail to connect are skipped (the channel still serves from the rest).
+    // Pass tlsOptions to dial each subchannel over TLS/mTLS (see GrpcClient).
+    constructor(target: string, policy: int, tlsOptions: any?) {
+        var endpoints: []Endpoint = resolveStatic(target)
+        this._resolved = endpoints.length
+        this._clients = []
+        this._serving = []
+        this._policy = policy
+        this._next = 0
+        var i: int = 0
+        while (i < endpoints.length) {
+            var ep: Endpoint = endpoints[i]
+            try {
+                var c: GrpcClient = new GrpcClient(ep.host, ep.port, tlsOptions)
+                this._clients.push(c)
+                this._serving.push(true)
+            } catch (e) {
+                // Unreachable endpoint — exclude it from the working set.
+            }
+            i = i + 1
+        }
+    }
+
+    // Number of endpoints the resolver produced (reachable or not).
+    public endpointCount(): int {
+        return this._resolved
+    }
+
+    // Number of live subchannels (endpoints that connected successfully).
+    public subchannelCount(): int {
+        return this._clients.length
+    }
+
+    // Number of subchannels currently eligible to serve (live AND serving).
+    public readyCount(): int {
+        var n: int = 0
+        var i: int = 0
+        while (i < this._serving.length) {
+            if (this._serving[i]) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        return n
+    }
+
+    // Pick the next eligible subchannel index for the active policy, or -1 if
+    // none are serving. Round-robin advances the cursor and skips unhealthy
+    // subchannels; pick-first returns the first serving subchannel.
+    private _pick(): int {
+        var n: int = this._clients.length
+        if (n == 0) {
+            return -1
+        }
+        if (this._policy == LB_PICK_FIRST) {
+            var i: int = 0
+            while (i < n) {
+                if (this._serving[i]) {
+                    return i
+                }
+                i = i + 1
+            }
+            return -1
+        }
+        var tries: int = 0
+        while (tries < n) {
+            var idx: int = this._next % n
+            this._next = (this._next + 1) % n
+            if (this._serving[idx]) {
+                return idx
+            }
+            tries = tries + 1
+        }
+        return -1
+    }
+
+    // Reply returned when no subchannel is available to serve a call.
+    private _noSubchannel(): GrpcReply {
+        return mkReply(emptyBuf(), STATUS_UNAVAILABLE, "no available subchannel", emptyHeaders(), emptyHeaders())
+    }
+
+    // Unary RPC routed to a load-balanced subchannel.
+    public unary(method: string, message: Buffer): GrpcReply {
+        var idx: int = this._pick()
+        if (idx < 0) {
+            return this._noSubchannel()
+        }
+        var c: GrpcClient = this._clients[idx]
+        return c.unary(method, message)
+    }
+
+    // Unary RPC with a per-call timeout, routed to a subchannel.
+    public unaryWithin(method: string, message: Buffer, timeoutMs: int): GrpcReply {
+        var idx: int = this._pick()
+        if (idx < 0) {
+            return this._noSubchannel()
+        }
+        var c: GrpcClient = this._clients[idx]
+        return c.unaryWithin(method, message, timeoutMs)
+    }
+
+    // Unary RPC with custom request metadata, routed to a subchannel.
+    public unaryMeta(method: string, message: Buffer, md: Metadata): GrpcReply {
+        var idx: int = this._pick()
+        if (idx < 0) {
+            return this._noSubchannel()
+        }
+        var c: GrpcClient = this._clients[idx]
+        return c.unaryMeta(method, message, md)
+    }
+
+    // Server-streaming RPC routed to a subchannel.
+    public serverStream(method: string, message: Buffer): GrpcClientCall {
+        var idx: int = this._pick()
+        if (idx < 0) {
+            throw "no available subchannel"
+        }
+        var c: GrpcClient = this._clients[idx]
+        return c.serverStream(method, message)
+    }
+
+    // Client-streaming RPC routed to a subchannel.
+    public clientStream(method: string): GrpcClientCall {
+        var idx: int = this._pick()
+        if (idx < 0) {
+            throw "no available subchannel"
+        }
+        var c: GrpcClient = this._clients[idx]
+        return c.clientStream(method)
+    }
+
+    // Bidirectional-streaming RPC routed to a subchannel.
+    public bidiStream(method: string): GrpcClientCall {
+        var idx: int = this._pick()
+        if (idx < 0) {
+            throw "no available subchannel"
+        }
+        var c: GrpcClient = this._clients[idx]
+        return c.bidiStream(method)
+    }
+
+    // Apply a request codec ("gzip" | "identity") to every subchannel.
+    public setCompression(encoding: string): void {
+        var i: int = 0
+        while (i < this._clients.length) {
+            this._clients[i].setCompression(encoding)
+            i = i + 1
+        }
+    }
+
+    // Apply a retry policy to every subchannel.
+    public setRetryPolicy(policy: RetryPolicy): void {
+        var i: int = 0
+        while (i < this._clients.length) {
+            this._clients[i].setRetryPolicy(policy)
+            i = i + 1
+        }
+    }
+
+    // Enable HTTP/2 keepalive on every subchannel.
+    public enableKeepalive(timeMs: int, timeoutMs: int): void {
+        var i: int = 0
+        while (i < this._clients.length) {
+            this._clients[i].enableKeepalive(timeMs, timeoutMs)
+            i = i + 1
+        }
+    }
+
+    // Probe each subchannel's health (M15) and update its eligibility: a
+    // subchannel is kept in the rotation only while it reports SERVING for
+    // `service` (use "" for overall server health). Call periodically to make
+    // load balancing health-aware so calls avoid NOT_SERVING backends.
+    public refreshHealth(service: string): void {
+        var i: int = 0
+        while (i < this._clients.length) {
+            var hc: HealthClient = new HealthClient(this._clients[i])
+            this._serving[i] = (hc.check(service) == SERVING_SERVING)
+            i = i + 1
+        }
+    }
+
+    // Close every subchannel.
+    public close(): void {
+        var i: int = 0
+        while (i < this._clients.length) {
+            this._clients[i].close()
+            i = i + 1
+        }
+    }
+}
+
+// ─── Health checking (grpc.health.v1.Health) ───────────────────────────────
+// The standard gRPC health-checking protocol. A server hosts a Health service
+// that reports per-service serving status; clients probe it with Check (unary)
+// or Watch (server-streaming). Service "" denotes the whole server. Used on its
+// own for readiness probes, and by GrpcChannel.refreshHealth for health-aware
+// load balancing.
+
+// HealthCheckRequest { string service = 1; } encode/decode.
+function encodeHealthRequest(service: string): Buffer {
+    var w: ProtoWriter = new ProtoWriter()
+    if (service.length > 0) {
+        w.writeString(1, service)
+    }
+    return w.toBuffer()
+}
+
+function decodeHealthService(data: Buffer): string {
+    var r: ProtoReader = new ProtoReader(data)
+    var out: string = ""
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 1 && tag.wireType == PB_LEN) {
+            out = r.readString()
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return out
+}
+
+// HealthCheckResponse { ServingStatus status = 1; } encode/decode.
+function encodeHealthResponse(status: int): Buffer {
+    var w: ProtoWriter = new ProtoWriter()
+    w.writeInt32(1, status)
+    return w.toBuffer()
+}
+
+function decodeHealthStatus(data: Buffer): int {
+    var r: ProtoReader = new ProtoReader(data)
+    var st: int = SERVING_UNKNOWN
+    while (r.hasMore()) {
+        var tag: ProtoTag = r.readTag()
+        if (tag.field == 1 && tag.wireType == PB_VARINT) {
+            st = r.readVarint()
+        } else {
+            r.skip(tag.wireType)
+        }
+    }
+    return st
+}
+
+// Server-side health registry. Tracks a serving status per service name; the
+// empty name "" is the overall server status (defaults to SERVING). Register it
+// on a GrpcServer with registerHealthService(server, health).
+export class HealthService {
+    var _status: map[string]int
+
+    constructor() {
+        this._status = {}
+        this._status[""] = SERVING_SERVING
+    }
+
+    // Set the serving status for `service` ("" = whole server).
+    public setServingStatus(service: string, status: int): void {
+        this._status[service] = status
+    }
+
+    // Mark `service` as SERVING.
+    public setServing(service: string): void {
+        this._status[service] = SERVING_SERVING
+    }
+
+    // Mark `service` as NOT_SERVING.
+    public setNotServing(service: string): void {
+        this._status[service] = SERVING_NOT_SERVING
+    }
+
+    // Current status for `service`, or SERVICE_UNKNOWN if never registered.
+    public statusOf(service: string): int {
+        if (this._status.has(service)) {
+            return this._status[service]
+        }
+        return SERVING_SERVICE_UNKNOWN
+    }
+
+    // Unary Check handler: returns the service's status, or NOT_FOUND when the
+    // service is unknown (per the health protocol).
+    public check(req: GrpcRequest): GrpcResponse {
+        var service: string = decodeHealthService(req.data)
+        var st: int = this.statusOf(service)
+        if (st == SERVING_SERVICE_UNKNOWN) {
+            return grpcError(STATUS_NOT_FOUND, "unknown service: " + service)
+        }
+        return grpcOk(encodeHealthResponse(st))
+    }
+
+    // Server-streaming Watch handler: emits the current status once. (A full
+    // Watch streams status changes over time; this reports the present state,
+    // which covers readiness probing and health-aware load balancing.)
+    public watch(req: GrpcRequest, stream: GrpcServerStream): void {
+        var service: string = decodeHealthService(req.data)
+        stream.send(encodeHealthResponse(this.statusOf(service)))
+    }
+}
+
+// Register a HealthService on `server` at the standard health method paths.
+// Module-level (not a HealthService method) so the handler closures run in a
+// non-class frame and only touch the service's public surface.
+export function registerHealthService(server: GrpcServer, health: HealthService): void {
+    server.register(HEALTH_PATH_CHECK, function(req: GrpcRequest): GrpcResponse {
+        return health.check(req)
+    })
+    server.registerServerStream(HEALTH_PATH_WATCH, function(req: GrpcRequest, stream: GrpcServerStream): void {
+        health.watch(req, stream)
+    })
+}
+
+// Client-side health probe over an existing GrpcClient subchannel.
+export class HealthClient {
+    var _client: GrpcClient
+
+    constructor(client: GrpcClient) {
+        this._client = client
+    }
+
+    // Probe `service` ("" = whole server). Returns a ServingStatus; a failed
+    // RPC (e.g. server without a health service, or NOT_FOUND) maps to
+    // SERVICE_UNKNOWN so callers can treat it as "not serving".
+    public check(service: string): int {
+        var rep: GrpcReply = this._client.unary(HEALTH_PATH_CHECK, encodeHealthRequest(service))
+        if (rep.status != STATUS_OK) {
+            return SERVING_SERVICE_UNKNOWN
+        }
+        return decodeHealthStatus(rep.data)
+    }
+
+    // Convenience: true only when `service` reports SERVING.
+    public isServing(service: string): bool {
+        return this.check(service) == SERVING_SERVING
     }
 }
