@@ -1,9 +1,9 @@
 {
   "name": "@chuks/grpc",
-  "version": "0.0.1",
-  "description": "Wire-compatible gRPC for Chuks — HTTP/2 + HPACK + Protocol Buffers framing, interoperable with standard gRPC clients and servers in any language (verified against grpcurl). Pure Chuks implementation, no codegen.",
+  "version": "0.1.0",
+  "description": "Wire-compatible gRPC for Chuks — HTTP/2 (h2c + TLS/mTLS) + HPACK + Protocol Buffers framing. Unary and streaming (server/client/bidi) RPCs, deadlines, retries, client-side load balancing, health checking, server reflection, stats handlers, and the rich error model (google.rpc.Status details). Interoperable with standard gRPC clients and servers in any language (verified against grpcurl). Pure Chuks implementation, no codegen.",
   "main": "src/index.chuks",
-  "keywords": ["grpc", "http2", "protobuf", "hpack", "rpc", "microservices", "streaming"],
+  "keywords": ["grpc", "http2", "protobuf", "hpack", "rpc", "microservices", "streaming", "tls", "reflection", "load-balancing"],
   "author": "Chuks Team",
   "license": "MIT",
   "repository": "https://github.com/chuks-lang/chuks_grpc",
