@@ -3,7 +3,9 @@
 // This is the binary foundation gRPC messages are built on.
 //
 // No code generation: messages are encoded/decoded field-by-field through a
-// low-level ProtoWriter / ProtoReader, or via a schema-driven dynamic Message.
+// low-level ProtoWriter / ProtoReader. Covers all proto3 scalar types, nested
+// messages, bytes/strings, sint zigzag, sfixed sign-extension, and packed
+// repeated scalar fields (proto3's default repeated encoding).
 //
 // Wire format reference: https://protobuf.dev/programming-guides/encoding/
 // ───────────────────────────────────────────────────────────────────────────
@@ -39,6 +41,61 @@ export function zigzagEncode(n: int): int {
 // ZigZag decode.
 export function zigzagDecode(n: int): int {
     return lshr1(n) ^ (-(n & 1))
+}
+
+// ─── Packed-payload byte builders (no tags) ────────────────────────────────
+// Append a single value's wire bytes to a raw []int buffer. Used to build the
+// length-delimited payload of a packed repeated field before it is framed.
+
+function appendVarint(out: []int, value: int): void {
+    var v: int = value
+    while (true) {
+        var b: int = v & 0x7F
+        v = lshr7(v)
+        if (v != 0) {
+            out.push(b | 0x80)
+        } else {
+            out.push(b)
+            break
+        }
+    }
+}
+
+function appendFixed32(out: []int, v: int): void {
+    out.push(v & 0xFF)
+    out.push((v >> 8) & 0xFF)
+    out.push((v >> 16) & 0xFF)
+    out.push((v >> 24) & 0xFF)
+}
+
+function appendFixed64(out: []int, v: int): void {
+    out.push(v & 0xFF)
+    out.push((v >> 8) & 0xFF)
+    out.push((v >> 16) & 0xFF)
+    out.push((v >> 24) & 0xFF)
+    out.push((v >> 32) & 0xFF)
+    out.push((v >> 40) & 0xFF)
+    out.push((v >> 48) & 0xFF)
+    out.push((v >> 56) & 0xFF)
+}
+
+function appendFloatLE(out: []int, v: float): void {
+    var tmp = new Buffer(4)
+    tmp.writeFloat32BE(v)
+    out.push(tmp.getByte(3))
+    out.push(tmp.getByte(2))
+    out.push(tmp.getByte(1))
+    out.push(tmp.getByte(0))
+}
+
+function appendDoubleLE(out: []int, v: float): void {
+    var tmp = new Buffer(8)
+    tmp.writeFloat64BE(v)
+    var i: int = 7
+    while (i >= 0) {
+        out.push(tmp.getByte(i))
+        i = i - 1
+    }
 }
 
 // ─── A decoded tag (field number + wire type) ──────────────────────────────
@@ -214,6 +271,114 @@ export class ProtoWriter {
         }
     }
 
+    // ── Packed repeated fields ──────────────────────────────────────────────
+    // proto3 packs repeated scalar numeric fields by default: one LEN field
+    // whose payload is the concatenated values (no per-element tags).
+
+    // Frame a prebuilt payload as one length-delimited field.
+    private writePacked(field: int, raw: []int): void {
+        this.writeTag(field, PB_LEN)
+        this.writeVarint(raw.length)
+        var i: int = 0
+        while (i < raw.length) {
+            this.putByte(raw[i])
+            i = i + 1
+        }
+    }
+
+    // Packed int32/int64/uint32/uint64/enum (plain varints).
+    public writePackedInt32(field: int, values: []int): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            appendVarint(raw, values[i])
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
+    public writePackedInt64(field: int, values: []int): void {
+        this.writePackedInt32(field, values)
+    }
+
+    public writePackedUInt(field: int, values: []int): void {
+        this.writePackedInt32(field, values)
+    }
+
+    public writePackedEnum(field: int, values: []int): void {
+        this.writePackedInt32(field, values)
+    }
+
+    // Packed sint32/sint64 (zigzag varints).
+    public writePackedSInt(field: int, values: []int): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            appendVarint(raw, zigzagEncode(values[i]))
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
+    // Packed bool (1/0 varints).
+    public writePackedBool(field: int, values: []bool): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            if (values[i]) {
+                raw.push(1)
+            } else {
+                raw.push(0)
+            }
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
+    // Packed fixed32/sfixed32 (4-byte little-endian).
+    public writePackedFixed32(field: int, values: []int): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            appendFixed32(raw, values[i])
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
+    // Packed fixed64/sfixed64 (8-byte little-endian).
+    public writePackedFixed64(field: int, values: []int): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            appendFixed64(raw, values[i])
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
+    // Packed float (4-byte IEEE-754 little-endian).
+    public writePackedFloat(field: int, values: []float): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            appendFloatLE(raw, values[i])
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
+    // Packed double (8-byte IEEE-754 little-endian).
+    public writePackedDouble(field: int, values: []float): void {
+        var raw: []int = []
+        var i: int = 0
+        while (i < values.length) {
+            appendDoubleLE(raw, values[i])
+            i = i + 1
+        }
+        this.writePacked(field, raw)
+    }
+
     // ── Output ─────────────────────────────────────────────────────────────
 
     public toByteArray(): []int {
@@ -374,6 +539,100 @@ export class ProtoReader {
     public readMessage(): ProtoReader {
         var sub: Buffer = this.readBytes()
         return new ProtoReader(sub)
+    }
+
+    // ── Unsigned / signed-fixed scalar reads ────────────────────────────────
+
+    // uint32/uint64 (same wire as varint; alias for clarity).
+    public readUInt(): int {
+        return this.readVarint()
+    }
+
+    // sfixed32: 4-byte little-endian with sign extension to 64-bit.
+    public readSFixed32(): int {
+        var v: int = this.readFixed32Raw()
+        if ((v & 0x80000000) != 0) {
+            v = v - 0x100000000
+        }
+        return v
+    }
+
+    // sfixed64: 8-byte little-endian (already full-width signed).
+    public readSFixed64(): int {
+        return this.readFixed64Raw()
+    }
+
+    // ── Packed repeated reads ───────────────────────────────────────────────
+    // Each reads the LEN prefix, then consumes elements until the payload ends.
+
+    public readPackedVarint(): []int {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []int = []
+        while (this._pos < end) {
+            out.push(this.readVarint())
+        }
+        return out
+    }
+
+    public readPackedSInt(): []int {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []int = []
+        while (this._pos < end) {
+            out.push(zigzagDecode(this.readVarint()))
+        }
+        return out
+    }
+
+    public readPackedBool(): []bool {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []bool = []
+        while (this._pos < end) {
+            out.push(this.readVarint() != 0)
+        }
+        return out
+    }
+
+    public readPackedFixed32(): []int {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []int = []
+        while (this._pos < end) {
+            out.push(this.readFixed32Raw())
+        }
+        return out
+    }
+
+    public readPackedFixed64(): []int {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []int = []
+        while (this._pos < end) {
+            out.push(this.readFixed64Raw())
+        }
+        return out
+    }
+
+    public readPackedFloat(): []float {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []float = []
+        while (this._pos < end) {
+            out.push(this.readFloat())
+        }
+        return out
+    }
+
+    public readPackedDouble(): []float {
+        var n: int = this.readVarint()
+        var end: int = this._pos + n
+        var out: []float = []
+        while (this._pos < end) {
+            out.push(this.readDouble())
+        }
+        return out
     }
 
     // Skip a field's value given its wire type (for unknown fields).

@@ -227,6 +227,105 @@ try {
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 16 bytes — " + string(e)) }
 
+// 17 — packed repeated int32 field 6 = [3, 270, 86942]  →  32 06 03 8e 02 9e a7 05
+//      (golden vector from the protobuf encoding spec)
+try {
+    var w = new ProtoWriter()
+    var vals: []int = [3, 270, 86942]
+    w.writePackedInt32(6, vals)
+    test.assertEqual(hexOf(w), "3206038e029ea705")
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 17 packed int32 golden — " + string(e)) }
+
+// 18 — packed varint round-trip
+try {
+    var w = new ProtoWriter()
+    var vals: []int = [3, 270, 86942]
+    w.writePackedInt32(6, vals)
+    var r = new ProtoReader(w.toBuffer())
+    var t: ProtoTag = r.readTag()
+    test.assertEqual(t.field, 6)
+    test.assertEqual(t.wireType, PB_LEN)
+    var got2: []int = r.readPackedVarint()
+    test.assertEqual(got2.length, 3)
+    test.assertEqual(got2[0], 3)
+    test.assertEqual(got2[1], 270)
+    test.assertEqual(got2[2], 86942)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 18 packed varint round-trip — " + string(e)) }
+
+// 19 — sfixed32 sign extension: -1 reads back as -1 (signed) and 4294967295 (unsigned)
+try {
+    var w = new ProtoWriter()
+    w.writeFixed32(1, -1)
+    var r = new ProtoReader(w.toBuffer())
+    r.readTag()
+    test.assertEqual(r.readSFixed32(), -1)
+
+    var w2 = new ProtoWriter()
+    w2.writeFixed32(1, -1)
+    var r2 = new ProtoReader(w2.toBuffer())
+    r2.readTag()
+    test.assertEqual(r2.readFixed32(), 4294967295)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 19 sfixed32 sign extension — " + string(e)) }
+
+// 20 — packed sint / bool / double / fixed64 / float round-trips
+try {
+    var w = new ProtoWriter()
+    var si: []int = [-1, 1, -2]
+    var bo: []bool = [true, false, true]
+    var db: []float = [1.0, 3.14159]
+    var f64: []int = [1, 2]
+    var f32: []float = [1.5]
+    w.writePackedSInt(1, si)
+    w.writePackedBool(2, bo)
+    w.writePackedDouble(3, db)
+    w.writePackedFixed64(4, f64)
+    w.writePackedFloat(5, f32)
+
+    var r = new ProtoReader(w.toBuffer())
+
+    r.readTag()
+    var gs: []int = r.readPackedSInt()
+    test.assertEqual(gs.length, 3)
+    test.assertEqual(gs[0], -1)
+    test.assertEqual(gs[2], -2)
+
+    r.readTag()
+    var gb: []bool = r.readPackedBool()
+    test.assertEqual(gb.length, 3)
+    test.assertEqual(gb[0], true)
+    test.assertEqual(gb[1], false)
+
+    r.readTag()
+    var gd: []float = r.readPackedDouble()
+    test.assertEqual(gd.length, 2)
+    test.assertEqual(gd[1], 3.14159)
+
+    r.readTag()
+    var gf: []int = r.readPackedFixed64()
+    test.assertEqual(gf.length, 2)
+    test.assertEqual(gf[0], 1)
+    test.assertEqual(gf[1], 2)
+
+    r.readTag()
+    var gff: []float = r.readPackedFloat()
+    test.assertEqual(gff.length, 1)
+    test.assertEqual(gff[0], 1.5)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 20 packed scalar round-trips — " + string(e)) }
+
+// 21 — uint read alias and large unsigned varint
+try {
+    var w = new ProtoWriter()
+    w.writeUInt(1, 4294967295)
+    var r = new ProtoReader(w.toBuffer())
+    r.readTag()
+    test.assertEqual(r.readUInt(), 4294967295)
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 21 uint alias — " + string(e)) }
+
 print("═══════════════════════════════════════")
 print("  protobuf codec test results")
 print("  Passed: " + string(passed))
