@@ -7,7 +7,7 @@
 //   └────────────┴───────────────────┴───────────────────────────┘
 //
 // This module encodes single messages and decodes a byte stream (which may
-// split or coalesce messages across DATA frames) back into whole messages.
+    // split or coalesce messages across DATA frames) back into whole messages.
 // ───────────────────────────────────────────────────────────────────────────
 
 import { Buffer } from "std/buffer"

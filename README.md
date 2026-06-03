@@ -95,22 +95,22 @@ client.close()
 
 ### `GrpcServer`
 
-| Member | Description |
-| --- | --- |
-| `new GrpcServer(host, port)` | Bind a listener immediately. Pass port `0` for an OS-assigned port. |
-| `register(method, handler)` | Register a unary handler for a method path, e.g. `"/pkg.Service/Method"`. Handler signature: `function(req: GrpcRequest): GrpcResponse`. |
-| `addr()` | The listening address (`"host:port"`). |
-| `serve()` | Accept connections forever, handling each to completion. |
-| `serveOnce()` | Accept and fully handle exactly one connection, then return (handy for tests). |
-| `close()` | Stop listening. |
+| Member                       | Description                                                                                                                              |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `new GrpcServer(host, port)` | Bind a listener immediately. Pass port `0` for an OS-assigned port.                                                                      |
+| `register(method, handler)`  | Register a unary handler for a method path, e.g. `"/pkg.Service/Method"`. Handler signature: `function(req: GrpcRequest): GrpcResponse`. |
+| `addr()`                     | The listening address (`"host:port"`).                                                                                                   |
+| `serve()`                    | Accept connections forever, handling each to completion.                                                                                 |
+| `serveOnce()`                | Accept and fully handle exactly one connection, then return (handy for tests).                                                           |
+| `close()`                    | Stop listening.                                                                                                                          |
 
 ### `GrpcClient`
 
-| Member | Description |
-| --- | --- |
-| `new GrpcClient(host, port)` | Connect and exchange the HTTP/2 preface. |
-| `unary(method, message)` | Send one request message, await one `GrpcReply`. |
-| `close()` | Close the connection. |
+| Member                       | Description                                      |
+| ---------------------------- | ------------------------------------------------ |
+| `new GrpcClient(host, port)` | Connect and exchange the HTTP/2 preface.         |
+| `unary(method, message)`     | Send one request message, await one `GrpcReply`. |
+| `close()`                    | Close the connection.                            |
 
 ### Data types
 

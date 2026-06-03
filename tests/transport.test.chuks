@@ -1,0 +1,152 @@
+// ─── chuks_grpc · transport (Http2Conn) round-trip tests ───────────────────
+// Drives the multiplexed HTTP/2 driver directly: a server echoes every inbound
+// message on a stream, exercising streaming send/recv, flow control, and the
+// mux/reader actor model over a live TCP connection.
+
+import { test } from "std/test"
+import { Buffer } from "std/buffer"
+import { TcpServer, TcpConnection } from "std/net"
+import { Http2Conn, Http2Stream, Http2StreamEnd } from "../src/transport.chuks"
+import { HpackHeader } from "../src/hpack.chuks"
+import { GrpcMessage } from "../src/framing.chuks"
+
+var passed: any = 0
+var failed: any = 0
+
+function portOf(addr: string): int {
+    var b: Buffer = Buffer.fromString(addr)
+    var n: int = b.length()
+    var colon: int = -1
+    var i: int = 0
+    while (i < n) {
+        if (b.getByte(i) == 58) { colon = i }
+        i = i + 1
+    }
+    var val: int = 0
+    var j: int = colon + 1
+    while (j < n) {
+        var c: int = b.getByte(j)
+        if (c >= 48 && c <= 57) { val = val * 10 + (c - 48) }
+        j = j + 1
+    }
+    return val
+}
+
+function hdr(name: string, value: string): HpackHeader {
+    var h: HpackHeader = { name: name, value: value }
+    return h
+}
+
+function bufEq(a: Buffer, b: Buffer): bool {
+    if (a.length() != b.length()) { return false }
+    var i: int = 0
+    while (i < a.length()) {
+        if (a.getByte(i) != b.getByte(i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Server: echo every inbound message back, then send OK trailers.
+async function echoStream(st: Http2Stream): Task<void> {
+    var respHdrs: []HpackHeader = [hdr(":status", "200"), hdr("content-type", "application/grpc")]
+    st.sendHeaders(respHdrs, false)
+    var m: GrpcMessage? = st.recv()
+    while (m != null) {
+        st.sendMessage(m.data)
+        m = st.recv()
+    }
+    var trailers: []HpackHeader = [hdr("grpc-status", "0"), hdr("grpc-message", "")]
+    st.sendTrailers(trailers)
+}
+
+// Server: accept one TCP connection and serve all its streams concurrently.
+async function serveConn(server: TcpServer): Task<void> {
+    var conn: TcpConnection = server.accept()
+    var h2: Http2Conn = new Http2Conn(conn, true)
+    h2.serverHandshake()
+    h2.start()
+    var st: Http2Stream? = h2.acceptStream()
+    while (st != null) {
+        spawn echoStream(st)
+        st = h2.acceptStream()
+    }
+}
+
+function reqHeaders(port: int, path: string): []HpackHeader {
+    var hs: []HpackHeader = [
+        hdr(":method", "POST"),
+        hdr(":scheme", "http"),
+        hdr(":path", path),
+        hdr(":authority", "127.0.0.1:" + string(port)),
+        hdr("content-type", "application/grpc"),
+        hdr("te", "trailers")
+    ]
+    return hs
+}
+
+// 1 — single-message echo round-trip
+try {
+    var server: TcpServer = new TcpServer("127.0.0.1", 0)
+    var port: int = portOf(server.addr())
+    var sv: Task<void> = spawn serveConn(server)
+
+    var conn: TcpConnection = new TcpConnection("127.0.0.1", port)
+    var h2: Http2Conn = new Http2Conn(conn, false)
+    h2.clientHandshake()
+    h2.start()
+
+    var st: Http2Stream = h2.openStream(reqHeaders(port, "/echo.Echo/Say"))
+    st.sendMessage(Buffer.fromString("ping"))
+    st.closeSend()
+
+    var reply: GrpcMessage? = st.recv()
+    var end: Http2StreamEnd = st.result()
+    test.assertEqual(end.status, 0)
+    if (reply == null) { throw "no reply" }
+    if (!bufEq(reply.data, Buffer.fromString("ping"))) { throw "echo mismatch" }
+    conn.close()
+    server.close()
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 1 single echo — " + string(e)) }
+
+// 2 — multi-message stream echo (3 in, 3 out)
+try {
+    var server2: TcpServer = new TcpServer("127.0.0.1", 0)
+    var port2: int = portOf(server2.addr())
+    var sv2: Task<void> = spawn serveConn(server2)
+
+    var conn2: TcpConnection = new TcpConnection("127.0.0.1", port2)
+    var c2: Http2Conn = new Http2Conn(conn2, false)
+    c2.clientHandshake()
+    c2.start()
+
+    var st2: Http2Stream = c2.openStream(reqHeaders(port2, "/echo.Echo/Stream"))
+    st2.sendMessage(Buffer.fromString("a"))
+    st2.sendMessage(Buffer.fromString("bb"))
+    st2.sendMessage(Buffer.fromString("ccc"))
+    st2.closeSend()
+
+    var got: int = 0
+    var sizes: int = 0
+    var r: GrpcMessage? = st2.recv()
+    while (r != null) {
+        got = got + 1
+        sizes = sizes + r.data.length()
+        r = st2.recv()
+    }
+    var end2: Http2StreamEnd = st2.result()
+    test.assertEqual(end2.status, 0)
+    test.assertEqual(got, 3)
+    test.assertEqual(sizes, 6)
+    conn2.close()
+    server2.close()
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 2 multi echo — " + string(e)) }
+
+print("═══════════════════════════════════════")
+print("  transport (Http2Conn) test results")
+print("  Passed: " + string(passed))
+print("  Failed: " + string(failed))
+print("  Total:  " + string(passed + failed))
+print("═══════════════════════════════════════")

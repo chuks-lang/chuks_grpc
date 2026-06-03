@@ -66,6 +66,8 @@ export dataType GrpcReply {
     data: Buffer;
     status: int;
     message: string;
+    headers: []HpackHeader;    // initial response metadata (server HEADERS)
+    trailers: []HpackHeader;   // trailing response metadata (server trailers)
 }
 
 // ─── Convenience constructors ──────────────────────────────────────────────
@@ -82,6 +84,145 @@ export function grpcError(status: int, message: string): GrpcResponse {
     var r: GrpcResponse = { data: Buffer.fromArray(none), status: status, message: message }
     return r
 }
+
+// ─── Metadata ───────────────────────────────────────────────────────────────
+// User-defined key/value pairs carried as HTTP/2 headers (request metadata) and
+// trailers (response trailing metadata). gRPC requires ASCII, lowercase keys;
+// keys are lowercased here. Reserved HTTP/2 pseudo-headers and gRPC protocol
+// headers are never surfaced as user metadata nor allowed to be set.
+
+// Lowercase an ASCII string (gRPC metadata keys must be lowercase).
+function asciiLower(s: string): string {
+    var b: Buffer = Buffer.fromString(s)
+    var n: int = b.length()
+    var out: []any = []
+    var i: int = 0
+    while (i < n) {
+        var c: int = b.getByte(i)
+        if (c >= 65 && c <= 90) {
+            c = c + 32
+        }
+        out.push(c)
+        i = i + 1
+    }
+    return Buffer.fromArray(out).toStringUtf8()
+}
+
+// True for HTTP/2 pseudo-headers and gRPC protocol headers that must not be
+// exposed or overwritten as user metadata.
+function isReservedHeader(name: string): bool {
+    var b: Buffer = Buffer.fromString(name)
+    if (b.length() > 0 && b.getByte(0) == 58) {   // leading ':' (pseudo-header)
+        return true
+    }
+    if (name == "content-type") { return true }
+    if (name == "te") { return true }
+    if (name == "grpc-timeout") { return true }
+    if (name == "grpc-status") { return true }
+    if (name == "grpc-message") { return true }
+    if (name == "grpc-encoding") { return true }
+    if (name == "grpc-accept-encoding") { return true }
+    if (name == "user-agent") { return true }
+    return false
+}
+
+export class Metadata {
+    var _pairs: []HpackHeader
+
+    constructor() {
+        var empty: []HpackHeader = []
+        this._pairs = empty
+    }
+
+    // Set a key to a single value, replacing any existing values for that key.
+    public set(key: string, value: string): void {
+        var k: string = asciiLower(key)
+        var out: []HpackHeader = []
+        var i: int = 0
+        while (i < this._pairs.length) {
+            if (this._pairs[i].name != k) {
+                out.push(this._pairs[i])
+            }
+            i = i + 1
+        }
+        out.push(hdr(k, value))
+        this._pairs = out
+    }
+
+    // Append a value for a key (gRPC metadata keys may repeat).
+    public append(key: string, value: string): void {
+        this._pairs.push(hdr(asciiLower(key), value))
+    }
+
+    // First value for a key, or "" if absent.
+    public get(key: string): string {
+        return findHeader(this._pairs, asciiLower(key))
+    }
+
+    // True if the key is present.
+    public has(key: string): bool {
+        var k: string = asciiLower(key)
+        var i: int = 0
+        while (i < this._pairs.length) {
+            if (this._pairs[i].name == k) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+
+    // All values for a key (in order).
+    public getAll(key: string): []string {
+        var k: string = asciiLower(key)
+        var out: []string = []
+        var i: int = 0
+        while (i < this._pairs.length) {
+            if (this._pairs[i].name == k) {
+                out.push(this._pairs[i].value)
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // The number of key/value pairs.
+    public size(): int {
+        return this._pairs.length
+    }
+
+    // The raw header list (for wire encoding). User keys only.
+    public pairs(): []HpackHeader {
+        return this._pairs
+    }
+}
+
+// Build Metadata from a raw header list, dropping reserved headers.
+export function metadataFromHeaders(h: []HpackHeader): Metadata {
+    var md: Metadata = new Metadata()
+    var i: int = 0
+    while (i < h.length) {
+        var name: string = h[i].name
+        if (!isReservedHeader(name)) {
+            md._pairs.push(hdr(name, h[i].value))
+        }
+        i = i + 1
+    }
+    return md
+}
+
+// An empty header list literal.
+function emptyHeaders(): []HpackHeader {
+    var e: []HpackHeader = []
+    return e
+}
+
+// Construct a client reply with response metadata.
+function mkReply(data: Buffer, status: int, message: string, headers: []HpackHeader, trailers: []HpackHeader): GrpcReply {
+    var r: GrpcReply = { data: data, status: status, message: message, headers: headers, trailers: trailers }
+    return r
+}
+
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
@@ -185,6 +326,21 @@ function requestHeadersT(method: string, authority: string, timeoutMs: int): []H
     return hs
 }
 
+// Request headers with a per-call timeout and custom user metadata appended.
+// Reserved headers in `md` are skipped so the protocol headers can't be spoofed.
+function requestHeadersM(method: string, authority: string, timeoutMs: int, md: Metadata): []HpackHeader {
+    var hs: []HpackHeader = requestHeadersT(method, authority, timeoutMs)
+    var extra: []HpackHeader = md.pairs()
+    var i: int = 0
+    while (i < extra.length) {
+        if (!isReservedHeader(extra[i].name)) {
+            hs.push(extra[i])
+        }
+        i = i + 1
+    }
+    return hs
+}
+
 // Standard gRPC response headers (initial server HEADERS).
 function responseHeaders(): []HpackHeader {
     var hs: []HpackHeader = [hdr(":status", "200"), hdr("content-type", "application/grpc")]
@@ -210,6 +366,8 @@ export class GrpcServerStream {
     var _headersSent: bool
     var _deadlineMs: int
     var _cancelObserved: bool
+    var _respHeaders: []HpackHeader
+    var _respTrailers: []HpackHeader
 
     constructor(st: Http2Stream, method: string, meta: []HpackHeader) {
         this._st = st
@@ -218,6 +376,10 @@ export class GrpcServerStream {
         this._headersSent = false
         this._deadlineMs = deadlineFromMeta(meta)
         this._cancelObserved = false
+        var hh: []HpackHeader = []
+        this._respHeaders = hh
+        var tt: []HpackHeader = []
+        this._respTrailers = tt
     }
 
     // The full method path, e.g. "/package.Service/Method".
@@ -228,6 +390,36 @@ export class GrpcServerStream {
     // The request's initial metadata (HTTP/2 request headers).
     public metadata(): []HpackHeader {
         return this._meta
+    }
+
+    // The request's user metadata (reserved/protocol headers removed).
+    public requestMetadata(): Metadata {
+        return metadataFromHeaders(this._meta)
+    }
+
+    // First value of a request header by (case-insensitive) key, or "".
+    public header(key: string): string {
+        return findHeader(this._meta, asciiLower(key))
+    }
+
+    // Add a custom response header (initial metadata). Must be called before the
+    // first send()/finish(); later calls are ignored once headers are flushed.
+    public setHeader(key: string, value: string): void {
+        if (this._headersSent) {
+            return
+        }
+        if (isReservedHeader(asciiLower(key))) {
+            return
+        }
+        this._respHeaders.push(hdr(asciiLower(key), value))
+    }
+
+    // Add a custom trailing-metadata header, sent with the terminal status.
+    public setTrailer(key: string, value: string): void {
+        if (isReservedHeader(asciiLower(key))) {
+            return
+        }
+        this._respTrailers.push(hdr(asciiLower(key), value))
     }
 
     // Absolute deadline for this RPC (ms since epoch), or 0 if the client set
@@ -277,7 +469,13 @@ export class GrpcServerStream {
     private _ensureHeaders(): void {
         if (!this._headersSent) {
             this._headersSent = true
-            this._st.sendHeaders(responseHeaders(), false)
+            var hs: []HpackHeader = responseHeaders()
+            var i: int = 0
+            while (i < this._respHeaders.length) {
+                hs.push(this._respHeaders[i])
+                i = i + 1
+            }
+            this._st.sendHeaders(hs, false)
         }
     }
 
@@ -291,6 +489,11 @@ export class GrpcServerStream {
     public finish(status: int, message: string): void {
         this._ensureHeaders()
         var trailers: []HpackHeader = [hdr("grpc-status", string(status)), hdr("grpc-message", message)]
+        var i: int = 0
+        while (i < this._respTrailers.length) {
+            trailers.push(this._respTrailers[i])
+            i = i + 1
+        }
         this._st.sendTrailers(trailers)
     }
 }
@@ -442,11 +645,14 @@ export class GrpcClientCall {
     var _st: Http2Stream
     var _deadlineMs: int   // absolute deadline (ms since epoch); 0 = none
     var _cancelled: bool   // set by cancel()
+    var _trailers: []HpackHeader   // captured at result()
 
     constructor(st: Http2Stream) {
         this._st = st
         this._deadlineMs = 0
         this._cancelled = false
+        var tt: []HpackHeader = []
+        this._trailers = tt
     }
 
     // Attach an absolute deadline (ms since epoch). Called by the client openers
@@ -491,29 +697,38 @@ export class GrpcClientCall {
         return null
     }
 
+    // The initial response metadata (server HEADERS). Available once the first
+    // message has been received or the call has finished.
+    public headers(): Metadata {
+        return metadataFromHeaders(this._st.initialMeta)
+    }
+
+    // The trailing response metadata. Populated after result() returns.
+    public trailers(): Metadata {
+        return metadataFromHeaders(this._trailers)
+    }
+
     // Block for the terminal status/trailers of the call. When a deadline was
     // set, polls so the call cannot hang past it: on expiry the stream is reset
     // and a DEADLINE_EXCEEDED reply is returned.
     public result(): GrpcReply {
         if (this._cancelled) {
-            var cr: GrpcReply = { data: emptyBuf(), status: STATUS_CANCELLED, message: "call cancelled" }
-            return cr
+            return mkReply(emptyBuf(), STATUS_CANCELLED, "call cancelled", emptyHeaders(), emptyHeaders())
         }
         if (this._deadlineMs == 0) {
             var end: Http2StreamEnd = this._st.result()
-            var reply: GrpcReply = { data: emptyBuf(), status: end.status, message: end.message }
-            return reply
+            this._trailers = end.trailers
+            return mkReply(emptyBuf(), end.status, end.message, this._st.initialMeta, end.trailers)
         }
         while (true) {
             var done: Http2StreamEnd? = this._st.tryResult()
             if (done != null) {
-                var r2: GrpcReply = { data: emptyBuf(), status: done.status, message: done.message }
-                return r2
+                this._trailers = done.trailers
+                return mkReply(emptyBuf(), done.status, done.message, this._st.initialMeta, done.trailers)
             }
             if (time.now() >= this._deadlineMs) {
                 this._st.reset(ERR_CANCEL)
-                var dl: GrpcReply = { data: emptyBuf(), status: STATUS_DEADLINE_EXCEEDED, message: "deadline exceeded" }
-                return dl
+                return mkReply(emptyBuf(), STATUS_DEADLINE_EXCEEDED, "deadline exceeded", emptyHeaders(), emptyHeaders())
             }
             time.sleep(1)
         }
@@ -552,15 +767,34 @@ export class GrpcClient {
         return this._h2.openStream(requestHeadersT(method, this._authority, timeoutMs))
     }
 
+    // Open a raw stream carrying a timeout and custom request metadata.
+    private _openM(method: string, timeoutMs: int, md: Metadata): Http2Stream {
+        return this._h2.openStream(requestHeadersM(method, this._authority, timeoutMs, md))
+    }
+
     // Unary RPC: send one request, await one reply.
     public unary(method: string, message: Buffer): GrpcReply {
-        return this.unaryWithin(method, message, 0)
+        return this._unaryCore(method, message, new Metadata(), 0)
     }
 
     // Unary RPC with a per-call timeout (ms; 0 = no deadline). On expiry the
     // stream is reset and a DEADLINE_EXCEEDED reply is returned.
     public unaryWithin(method: string, message: Buffer, timeoutMs: int): GrpcReply {
-        var st: Http2Stream = this._openT(method, timeoutMs)
+        return this._unaryCore(method, message, new Metadata(), timeoutMs)
+    }
+
+    // Unary RPC with custom request metadata.
+    public unaryMeta(method: string, message: Buffer, md: Metadata): GrpcReply {
+        return this._unaryCore(method, message, md, 0)
+    }
+
+    // Unary RPC with custom request metadata and a per-call timeout.
+    public unaryMetaWithin(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
+        return this._unaryCore(method, message, md, timeoutMs)
+    }
+
+    private _unaryCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcReply {
+        var st: Http2Stream = this._openM(method, timeoutMs, md)
         st.sendMessage(message)
         st.closeSend()
         if (timeoutMs <= 0) {
@@ -575,8 +809,7 @@ export class GrpcClient {
                 extra = st.recv()
             }
             var end: Http2StreamEnd = st.result()
-            var reply: GrpcReply = { data: respData, status: end.status, message: end.message }
-            return reply
+            return mkReply(respData, end.status, end.message, st.initialMeta, end.trailers)
         }
         var deadline: int = time.now() + timeoutMs
         var got: Buffer = emptyBuf()
@@ -587,13 +820,11 @@ export class GrpcClient {
             }
             var de: Http2StreamEnd? = st.tryResult()
             if (de != null) {
-                var r2: GrpcReply = { data: got, status: de.status, message: de.message }
-                return r2
+                return mkReply(got, de.status, de.message, st.initialMeta, de.trailers)
             }
             if (time.now() >= deadline) {
                 st.reset(ERR_CANCEL)
-                var dl: GrpcReply = { data: emptyBuf(), status: STATUS_DEADLINE_EXCEEDED, message: "deadline exceeded" }
-                return dl
+                return mkReply(emptyBuf(), STATUS_DEADLINE_EXCEEDED, "deadline exceeded", emptyHeaders(), emptyHeaders())
             }
             time.sleep(1)
         }
@@ -602,11 +833,20 @@ export class GrpcClient {
     // Server-streaming RPC: send one request, then read many responses via the
     // returned call (recv() until null, then result()).
     public serverStream(method: string, message: Buffer): GrpcClientCall {
-        return this.serverStreamWithin(method, message, 0)
+        return this._serverStreamCore(method, message, new Metadata(), 0)
     }
 
     public serverStreamWithin(method: string, message: Buffer, timeoutMs: int): GrpcClientCall {
-        var st: Http2Stream = this._openT(method, timeoutMs)
+        return this._serverStreamCore(method, message, new Metadata(), timeoutMs)
+    }
+
+    // Server-streaming RPC with custom request metadata.
+    public serverStreamMeta(method: string, message: Buffer, md: Metadata): GrpcClientCall {
+        return this._serverStreamCore(method, message, md, 0)
+    }
+
+    private _serverStreamCore(method: string, message: Buffer, md: Metadata, timeoutMs: int): GrpcClientCall {
+        var st: Http2Stream = this._openM(method, timeoutMs, md)
         st.sendMessage(message)
         st.closeSend()
         var call: GrpcClientCall = new GrpcClientCall(st)
@@ -619,11 +859,20 @@ export class GrpcClient {
     // Client-streaming RPC: send many requests via the returned call (send()…
         // closeSend()), then read one response (recv()) and result().
     public clientStream(method: string): GrpcClientCall {
-        return this.clientStreamWithin(method, 0)
+        return this._clientStreamCore(method, new Metadata(), 0)
     }
 
     public clientStreamWithin(method: string, timeoutMs: int): GrpcClientCall {
-        var st: Http2Stream = this._openT(method, timeoutMs)
+        return this._clientStreamCore(method, new Metadata(), timeoutMs)
+    }
+
+    // Client-streaming RPC with custom request metadata.
+    public clientStreamMeta(method: string, md: Metadata): GrpcClientCall {
+        return this._clientStreamCore(method, md, 0)
+    }
+
+    private _clientStreamCore(method: string, md: Metadata, timeoutMs: int): GrpcClientCall {
+        var st: Http2Stream = this._openM(method, timeoutMs, md)
         var call: GrpcClientCall = new GrpcClientCall(st)
         if (timeoutMs > 0) {
             call._setDeadline(time.now() + timeoutMs)
@@ -633,11 +882,20 @@ export class GrpcClient {
 
     // Bidirectional-streaming RPC: interleave send()/recv() on the returned call.
     public bidiStream(method: string): GrpcClientCall {
-        return this.bidiStreamWithin(method, 0)
+        return this._bidiStreamCore(method, new Metadata(), 0)
     }
 
     public bidiStreamWithin(method: string, timeoutMs: int): GrpcClientCall {
-        var st: Http2Stream = this._openT(method, timeoutMs)
+        return this._bidiStreamCore(method, new Metadata(), timeoutMs)
+    }
+
+    // Bidirectional-streaming RPC with custom request metadata.
+    public bidiStreamMeta(method: string, md: Metadata): GrpcClientCall {
+        return this._bidiStreamCore(method, md, 0)
+    }
+
+    private _bidiStreamCore(method: string, md: Metadata, timeoutMs: int): GrpcClientCall {
+        var st: Http2Stream = this._openM(method, timeoutMs, md)
         var call: GrpcClientCall = new GrpcClientCall(st)
         if (timeoutMs > 0) {
             call._setDeadline(time.now() + timeoutMs)

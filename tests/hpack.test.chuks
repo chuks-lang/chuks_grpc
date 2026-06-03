@@ -85,7 +85,7 @@ try {
         mk(":status", "200"),
         mk("content-type", "application/grpc"),
         mk("grpc-encoding", "identity"),
-        mk("grpc-accept-encoding", "identity,deflate,gzip")
+        mk("grpc-accept-encoding", "identity,deflate,gzip"),
     ]
     var block: Buffer = enc.encode(headers)
     var back: []HpackHeader = dec.decode(block)
@@ -110,7 +110,7 @@ try {
         mk(":authority", "localhost:50051"),
         mk("content-type", "application/grpc"),
         mk("te", "trailers"),
-        mk("user-agent", "grpc-chuks/0.1")
+        mk("user-agent", "grpc-chuks/0.1"),
     ]
     var block: Buffer = enc.encode(headers)
     var back: []HpackHeader = dec.decode(block)
@@ -130,7 +130,7 @@ try {
     var dec = new HpackDecoder(4096)
     var trailers: []HpackHeader = [
         mk("grpc-status", "0"),
-        mk("grpc-message", "")
+        mk("grpc-message", ""),
     ]
     var back: []HpackHeader = dec.decode(enc.encode(trailers))
     test.assertEqual(back.length, 2)

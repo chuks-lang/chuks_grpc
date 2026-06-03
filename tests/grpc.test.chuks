@@ -9,6 +9,7 @@ import { Channel } from "std/channel"
 import {
     GrpcServer, GrpcClient, GrpcRequest, GrpcResponse, GrpcReply,
     GrpcServerStream, GrpcClientCall,
+    Metadata, metadataFromHeaders,
     grpcOk,
     STATUS_OK, STATUS_UNIMPLEMENTED, STATUS_DEADLINE_EXCEEDED, STATUS_CANCELLED
 } from "../src/index.chuks"
@@ -126,6 +127,21 @@ function watchHandler(req: GrpcRequest, stream: GrpcServerStream): void {
         i = i + 1
     }
     cancelSignal.send(false)
+}
+
+// Unary handler: reads request metadata "x-user" and echoes it back.
+function metaUnaryHandler(req: GrpcRequest): GrpcResponse {
+    var user: string = metadataFromHeaders(req.metadata).get("x-user")
+    return grpcOk(encodeName("u=" + user))
+}
+
+// Server-streaming handler: reads request metadata, sets a custom response
+// header and trailer, and echoes the caller's "x-user" value once.
+function metaStreamHandler(req: GrpcRequest, stream: GrpcServerStream): void {
+    var user: string = stream.requestMetadata().get("x-user")
+    stream.setHeader("x-server", "v1")
+    stream.send(encodeName("user=" + user))
+    stream.setTrailer("x-trailer", "done")
 }
 
 // Run a single connection's worth of serving on a background task.
@@ -342,6 +358,48 @@ try {
     await t11
     passed = passed + 1
 } catch (e) { failed = failed + 1; print("FAIL 11 client cancel result — " + string(e)) }
+
+// 12 — unary request metadata: server reads custom header sent by client
+try {
+    var srv12: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv12.register("/echo.Echo/Meta", metaUnaryHandler)
+    var port12: int = portOf(srv12.addr())
+    var t12: Task<void> = spawn runServer(srv12)
+
+    var client12: GrpcClient = new GrpcClient("127.0.0.1", port12)
+    var md12: Metadata = new Metadata()
+    md12.set("x-user", "bob")
+    var rep12: GrpcReply = client12.unaryMeta("/echo.Echo/Meta", encodeName("x"), md12)
+    test.assertEqual(rep12.status, STATUS_OK)
+    test.assertEqual(decodeName(rep12.data), "u=bob")
+    client12.close()
+    await t12
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 12 unary request metadata — " + string(e)) }
+
+// 13 — response metadata: client reads server header + trailer
+try {
+    var srv13: GrpcServer = new GrpcServer("127.0.0.1", 0)
+    srv13.registerServerStream("/echo.Echo/MetaStream", metaStreamHandler)
+    var port13: int = portOf(srv13.addr())
+    var t13: Task<void> = spawn runServer(srv13)
+
+    var client13: GrpcClient = new GrpcClient("127.0.0.1", port13)
+    var md13: Metadata = new Metadata()
+    md13.set("X-User", "ada")   // mixed case key is lowercased on the wire
+    var call13: GrpcClientCall = client13.serverStreamMeta("/echo.Echo/MetaStream", encodeName("x"), md13)
+    var first13: Buffer? = call13.recv()
+    var body13: string = ""
+    if (first13 != null) { body13 = decodeName(first13) }
+    var rep13: GrpcReply = call13.result()
+    test.assertEqual(body13, "user=ada")
+    test.assertEqual(rep13.status, STATUS_OK)
+    test.assertEqual(call13.headers().get("x-server"), "v1")
+    test.assertEqual(call13.trailers().get("x-trailer"), "done")
+    client13.close()
+    await t13
+    passed = passed + 1
+} catch (e) { failed = failed + 1; print("FAIL 13 response metadata — " + string(e)) }
 
 print("═══════════════════════════════════════")
 print("  gRPC h2c round-trip test results")
