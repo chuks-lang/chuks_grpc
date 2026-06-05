@@ -1,0 +1,11 @@
+import { Buffer } from "std/buffer"
+
+export dataType Inner {
+    label: string;
+    weight: int;
+}
+
+export function defaultInner(): Inner {
+    var _m: Inner = { label: "", weight: 0 }
+    return _m
+}

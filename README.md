@@ -36,8 +36,8 @@ chuks add chuks_grpc
 
 ```chuks
 import { Buffer } from "std/buffer"
-import { GrpcServer, GrpcRequest, GrpcResponse, grpcOk } from "chuks_grpc"
-import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "chuks_grpc/src/protobuf.chuks"
+import { GrpcServer, GrpcRequest, GrpcResponse, grpcOk } from "pkg/@chuks/grpc"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "pkg/@chuks/grpc/src/protobuf.chuks"
 
 // message EchoRequest  { string name  = 1; }
 // message EchoResponse { string reply = 1; }
@@ -80,8 +80,8 @@ grpcurl -plaintext \
 ### Client
 
 ```chuks
-import { GrpcClient, GrpcReply, STATUS_OK } from "chuks_grpc"
-import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "chuks_grpc/src/protobuf.chuks"
+import { GrpcClient, GrpcReply, STATUS_OK } from "pkg/@chuks/grpc"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "pkg/@chuks/grpc/src/protobuf.chuks"
 
 var req: ProtoWriter = new ProtoWriter()
 req.writeString(1, "world")
@@ -127,7 +127,7 @@ them** (and assumes `Buffer` is imported), so they aren't repeated each time:
 
 ```chuks
 import { Buffer } from "std/buffer"
-import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "chuks_grpc/src/protobuf.chuks"
+import { ProtoWriter, ProtoReader, ProtoTag, PB_LEN } from "pkg/@chuks/grpc/src/protobuf.chuks"
 
 // Encode a single string field (field number 1).
 function encStr(s: string): Buffer {
@@ -184,7 +184,7 @@ One request fans out into a stream of responses. The handler receives the reques
 plus a `GrpcServerStream` and calls `send()` for each message:
 
 ```chuks
-import { GrpcServer, GrpcRequest, GrpcServerStream } from "chuks_grpc"
+import { GrpcServer, GrpcRequest, GrpcServerStream } from "pkg/@chuks/grpc"
 
 // Server: "/echo.Echo/Count" emits name0, name1, name2.
 function countHandler(req: GrpcRequest, stream: GrpcServerStream): void {
@@ -204,7 +204,7 @@ srv.serve()
 ```
 
 ```chuks
-import { GrpcClient, GrpcClientCall, GrpcReply, STATUS_OK } from "chuks_grpc"
+import { GrpcClient, GrpcClientCall, GrpcReply, STATUS_OK } from "pkg/@chuks/grpc"
 
 // Client: drain messages until recv() returns null, then read the final status.
 var client: GrpcClient = new GrpcClient("127.0.0.1", 50151)
@@ -225,7 +225,7 @@ The client sends a stream of requests and gets back one response. The handler
 drains the inbound stream, then returns a single `GrpcResponse`:
 
 ```chuks
-import { GrpcServer, GrpcServerStream, GrpcResponse, grpcOk } from "chuks_grpc"
+import { GrpcServer, GrpcServerStream, GrpcResponse, grpcOk } from "pkg/@chuks/grpc"
 
 // Server: "/echo.Echo/Collect" counts the requests it received.
 function collectHandler(stream: GrpcServerStream): GrpcResponse {
@@ -298,7 +298,7 @@ Attach key/value headers to a call and read them on the server. Use `Metadata`
 on the client and `metadataFromHeaders(req.metadata)` on the server:
 
 ```chuks
-import { Metadata, metadataFromHeaders } from "chuks_grpc"
+import { Metadata, metadataFromHeaders } from "pkg/@chuks/grpc"
 
 // Server: read an "authorization" header off the request.
 function whoHandler(req: GrpcRequest): GrpcResponse {
@@ -332,7 +332,7 @@ The client sends a deadline; the server sees it and can stop early. Use the
 `*Within` call variants to set a per-call timeout in milliseconds:
 
 ```chuks
-import { STATUS_DEADLINE_EXCEEDED } from "chuks_grpc"
+import { STATUS_DEADLINE_EXCEEDED } from "pkg/@chuks/grpc"
 
 // Client: fail the call if it takes longer than 500ms.
 var reply: GrpcReply = client.unaryWithin("/echo.Echo/Slow", encStr("x"), 500)
@@ -364,7 +364,7 @@ travel in the `grpc-status-details-bin` trailer:
 import {
     grpcError, grpcErrorWithDetails, mkErrorDetail, ErrorDetail,
     STATUS_INVALID_ARGUMENT
-} from "chuks_grpc"
+} from "pkg/@chuks/grpc"
 
 function failHandler(req: GrpcRequest): GrpcResponse {
     // A google.rpc.ErrorInfo-style detail (any protobuf message works).
@@ -401,7 +401,7 @@ Enable client-side retries for transient failures. The default policy retries
 RPC:
 
 ```chuks
-import { defaultRetryPolicy, RetryPolicy, STATUS_UNAVAILABLE } from "chuks_grpc"
+import { defaultRetryPolicy, RetryPolicy, STATUS_UNAVAILABLE } from "pkg/@chuks/grpc"
 
 client.setRetryPolicy(defaultRetryPolicy())
 
@@ -426,7 +426,7 @@ Opt into gzip. The server compresses responses for clients that advertise gzip;
 the client compresses requests when you set its codec:
 
 ```chuks
-import { ENCODING_GZIP } from "chuks_grpc"
+import { ENCODING_GZIP } from "pkg/@chuks/grpc"
 
 srv.enableCompression()              // server: gzip responses when negotiated
 client.setCompression(ENCODING_GZIP) // client: gzip outbound requests
@@ -501,7 +501,7 @@ comma-separated `host:port` list; pass TLS options as the third argument or
 `null` for h2c:
 
 ```chuks
-import { GrpcChannel, LB_ROUND_ROBIN } from "chuks_grpc"
+import { GrpcChannel, LB_ROUND_ROBIN } from "pkg/@chuks/grpc"
 
 var ch: GrpcChannel = new GrpcChannel("127.0.0.1:50151,127.0.0.1:50152", LB_ROUND_ROBIN, null)
 println("ready subchannels: " + string(ch.readyCount()))
@@ -520,7 +520,7 @@ your dependencies come and go:
 import {
     HealthService, registerHealthService, HealthClient,
     SERVING_SERVING, SERVING_NOT_SERVING
-} from "chuks_grpc"
+} from "pkg/@chuks/grpc"
 
 // Server: advertise health.
 var health: HealthService = new HealthService()
@@ -545,7 +545,7 @@ seeded from the server's registered methods (`list_services` is supported;
 descriptor lookups are not):
 
 ```chuks
-import { ReflectionService, registerReflectionService, ReflectionClient } from "chuks_grpc"
+import { ReflectionService, registerReflectionService, ReflectionClient } from "pkg/@chuks/grpc"
 
 // Server.
 var refl: ReflectionService = new ReflectionService()
@@ -566,7 +566,7 @@ Register a callback that fires once per finished RPC with timing and status, on
 either the server or the client:
 
 ```chuks
-import { RpcStats } from "chuks_grpc"
+import { RpcStats } from "pkg/@chuks/grpc"
 
 srv.useStatsHandler(function(s: RpcStats): void {
     println(s.method + " -> status " + string(s.status) + " in " + string(s.durationMs) + "ms")

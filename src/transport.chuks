@@ -374,7 +374,7 @@ export class Http2Conn {
     // Enable HTTP/2 keepalive on this connection: every `timeMs` of the loop the
     // connection emits a PING and waits up to `timeoutMs` for its ACK. If no ACK
     // arrives the peer is presumed dead and the connection is torn down (in-flight
-    // streams finish with UNAVAILABLE). Safe to call after start(); idempotent.
+        // streams finish with UNAVAILABLE). Safe to call after start(); idempotent.
     public enableKeepalive(timeMs: int, timeoutMs: int): void {
         if (timeMs <= 0) {
             return
